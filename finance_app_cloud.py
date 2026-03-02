@@ -275,14 +275,14 @@ def get_embedding_function(engine_choice: str = "auto"):
     if use_hf and HF_TOKEN:
         try:
             from langchain_huggingface import HuggingFaceEndpointEmbeddings
+            # 使用多语言模型，支持中英文混合 PDF 内容
+            # all-MiniLM-L6-v2 为纯英文模型，会导致中文 PDF 检索质量极差
             embeddings = HuggingFaceEndpointEmbeddings(
-                model="sentence-transformers/all-MiniLM-L6-v2",
+                model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
                 huggingfacehub_api_token=HF_TOKEN,
-                # timeout 参数已移除：HuggingFaceEndpointEmbeddings 当前版本
-                # Pydantic schema 不接受此参数（extra_forbidden），传入会直接报错
             )
             embeddings.embed_query("test")
-            return embeddings, "HuggingFace Inference API (all-MiniLM-L6-v2)"
+            return embeddings, "HuggingFace Inference API (multilingual-MiniLM-L12-v2)"
         except Exception as e:
             st.sidebar.warning(f"⚠️ HuggingFace 嵌入引擎失败：{e}")
 
@@ -929,12 +929,27 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
     RAG_MAX_CHUNKS  = 2
 
     def _rag_search(vs, queries, k=2, max_chunks=RAG_MAX_CHUNKS):
+        import re as _re
         seen, chunks = set(), []
+
+        def _is_low_quality(text: str) -> bool:
+            """过滤纯数字/表格/乱码 chunk，防止污染 LLM prompt。"""
+            stripped = text.strip()
+            if len(stripped) < 20:
+                return True
+            # 数字和符号占比超过 60% 视为低质量（财务表格原始数据）
+            non_text = len(_re.sub(r'[\u4e00-\u9fffA-Za-z]', '', stripped))
+            if non_text / max(len(stripped), 1) > 0.6:
+                return True
+            return False
+
         for q in queries:
             for doc in vs.similarity_search(q, k=k):
                 key = doc.page_content[:80]
                 if key not in seen:
                     seen.add(key)
+                    if _is_low_quality(doc.page_content):
+                        continue
                     src = doc.metadata.get("source", "未知").replace("\\", "/").split("/")[-1]
                     page = doc.metadata.get("page", "?")
                     page_label = page + 1 if isinstance(page, int) else page
