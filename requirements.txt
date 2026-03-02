@@ -10,3 +10,4 @@ langchain-google-genai>=2.0.0
 langchain-huggingface>=0.1.0
 duckduckgo-search>=6.0.0
 pypdf>=3.0.0
+faiss-cpu>=1.7.4
