@@ -76,7 +76,7 @@ import altair as alt
 from crewai import Agent, Task, Crew, Process
 from langchain_openai import ChatOpenAI  # 镜像本地版做法：ChatOpenAI 是纯 LangChain 对象，CrewAI 直接调用，完全不经过 LiteLLM 路由
 from crewai.tools import BaseTool
-from langchain_community.tools import DuckDuckGoSearchRun
+from duckduckgo_search import DDGS          # 直接使用原生库，绕过 langchain_community 版本兼容问题
 from pydantic import BaseModel, Field
 from typing import Type
 
@@ -102,7 +102,7 @@ if sys.platform == "win32":
 # 这是 run_crewai_analysis() 函数开头 "_pre_search_block" 的由来。
 # =============================================================================
 
-_ddg_runner = DuckDuckGoSearchRun()
+# DuckDuckGo 搜索使用原生 DDGS，按需在调用处实例化，无需模块级初始化
 
 # 预定义的6条搜索计划：(公司标识, 搜索词)
 _PLANNED_SEARCHES: list = [
@@ -1038,8 +1038,12 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             f"🔍 搜索进度：**{_idx}/6** | 公司：{_co} | 查询：`{_q}`"
         )
         try:
-            _raw = _ddg_runner.run(_q)
-            _snippet = str(_raw or "(no result)")
+            with DDGS() as _ddgs:
+                _results = _ddgs.text(_q, max_results=5)
+            _snippet = "\n".join(
+                f"{r.get('title', '')}: {r.get('body', '')}"
+                for r in (_results or [])
+            ) or "(no result)"
             if len(_snippet) > 600:
                 _snippet = _snippet[:600] + "...[截断]"
         except Exception as _e:
