@@ -1213,17 +1213,19 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
     # ── Python 层预建财务对比表 ────────────────────────────────────────────
     metrics_table_md = ""
     if df is not None and not df.empty:
+        def _v(row, col):
+            """从 row 中安全取值，None/NaN 返回 N/A。"""
+            val = row.get(col)
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return "N/A"
+            return str(val)
+
         rows_md = []
         for _, row in df.iterrows():
-            def _v(col):
-                val = row.get(col)
-                if val is None or (isinstance(val, float) and pd.isna(val)):
-                    return "N/A"
-                return str(val)
             rows_md.append(
-                f"| {_v('股票代码')} | {_v('Forward P/E')} | {_v('PEG Ratio (5yr)')} "
-                f"| {_v('ROE (%)')} | {_v('Operating Margin (%)')} "
-                f"| {_v('D/E (%)')} | {_v('FCF (B)')} | {_v('Current Ratio')} |"
+                f"| {_v(row,'股票代码')} | {_v(row,'Forward P/E')} | {_v(row,'PEG Ratio (5yr)')} "
+                f"| {_v(row,'ROE (%)')} | {_v(row,'Operating Margin (%)')} "
+                f"| {_v(row,'D/E (%)')} | {_v(row,'FCF (B)')} | {_v(row,'Current Ratio')} |"
             )
         metrics_table_md = (
             "| 股票代码 | Forward P/E | PEG | ROE | Operating Margin | D/E (%) | FCF | Current Ratio |\n"
@@ -1539,17 +1541,22 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
     # ── 第二层保障：用 Python 生成的表格强制替换第3节 ─────────────────────
     # LLM 经常在"原样输出"表格时丢失数值，此处直接覆盖，确保数据准确。
     if metrics_table_md and metrics_table_md != "（数据不可用）":
-        section3_block = (
-            "### 3. 关键财务指标对比\n"
-            + metrics_table_md
-        )
-        # 替换 LLM 输出中的第3节（无论其内容是否完整）
-        final_text = _re.sub(
-            r'(#{1,3}\s*3[\.。]?\s*关键财务指标对比.*?)(?=#{1,3}\s*4[\.。]?|$)',
-            section3_block + "\n\n",
-            final_text,
-            flags=_re.DOTALL
-        )
+        section3_header = "### 3. 关键财务指标对比"
+        section3_block  = section3_header + "\n" + metrics_table_md + "\n\n"
+
+        # 策略1：找到第3节标题，替换到下一个 ### 节之前
+        m3 = _re.search(r'#{1,3}\s*3[\.。]?\s*关键财务指标对比', final_text)
+        m4 = _re.search(r'#{1,3}\s*4[\.。]?\s', final_text)
+        if m3:
+            start = m3.start()
+            end   = m4.start() if m4 and m4.start() > start else len(final_text)
+            final_text = final_text[:start] + section3_block + final_text[end:]
+        else:
+            # 策略2：第3节完全缺失，插入到第4节之前；若第4节也没有则直接追加
+            if m4:
+                final_text = final_text[:m4.start()] + section3_block + final_text[m4.start():]
+            else:
+                final_text = final_text.rstrip() + "\n\n" + section3_block
 
     return final_text
 
