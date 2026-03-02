@@ -1476,6 +1476,51 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             "2. 检查 Groq API 密钥是否有效\n\n"
             f"**原始输出（供调试）：**\n```json\n{stripped[:500]}\n```"
         )
+        return final_text
+
+    # ── 后处理：强制重排章节顺序，去除 RAG 前导内容 ──────────────────────
+    import re as _re
+
+    def _reorder_report_sections(text: str) -> str:
+        """
+        LLM 有时不按 1→2→3→4→5 顺序输出，且会把 RAG 摘要/上下文内容
+        直接渲染在报告开头。此函数：
+        1. 按 ### 1 / ### 2 / ### 3 / ### 4 / ### 5 分割章节
+        2. 丢弃第 1 节之前的所有前导内容（RAG 泄漏、乱序片段等）
+        3. 按 1→2→3→4→5 重新拼接
+        """
+        # 匹配 "### 1." 或 "### 1 " 或 "## 1." 等形式的章节标题
+        section_pattern = _re.compile(
+            r'(?=^#{1,3}\s*\d+[\.。]?\s)', _re.MULTILINE
+        )
+        # 用更宽松的方式找各节起始位置
+        markers = list(_re.finditer(
+            r'^(#{1,3})\s*(\d+)[\.。]?\s', text, _re.MULTILINE
+        ))
+        if not markers:
+            return text  # 找不到章节标记，原样返回
+
+        sections = {}
+        for i, m in enumerate(markers):
+            sec_num = int(m.group(2))
+            start = m.start()
+            end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+            # 同一节号只保留首次出现（避免重复节）
+            if sec_num not in sections:
+                sections[sec_num] = text[start:end].rstrip()
+
+        if not sections:
+            return text
+
+        # 按 1→2→3→4→5 顺序输出，缺失的节跳过
+        ordered_keys = sorted(sections.keys())
+        return "\n\n".join(sections[k] for k in ordered_keys)
+
+    try:
+        final_text = _reorder_report_sections(final_text)
+    except Exception:
+        pass  # 后处理失败时保留原始输出，不影响主流程
+
     return final_text
 
 
