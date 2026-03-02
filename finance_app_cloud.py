@@ -168,7 +168,7 @@ def _make_groq_llm():
     os.environ["OPENAI_BASE_URL"] = "https://api.groq.com/openai/v1"  # openai SDK >= 1.x 读此变量
     os.environ["GROQ_API_KEY"]    = GROQ_API_KEY
     return ChatOpenAI(
-        model="llama-3.3-70b-versatile",
+        model="llama-3.1-8b-instant",
         base_url="https://api.groq.com/openai/v1",
         api_key=GROQ_API_KEY,
         temperature=0.1,
