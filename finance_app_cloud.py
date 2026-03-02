@@ -536,6 +536,27 @@ PERIOD_OPTIONS = [
     ("近 1 年", "1y"),
 ]
 
+# =============================================================================
+# 【yfinance 云端适配】自定义 requests.Session，注入浏览器 User-Agent
+# =============================================================================
+# Yahoo Finance 会封锁 AWS/GCP 等云端数据中心 IP，yfinance 直接请求时静默返回空数据。
+# 解决方案：伪装成普通浏览器发起请求，绕过云端 IP 检测。
+# _yf_session 在模块级创建，统一复用，避免重复建立连接。
+# =============================================================================
+import requests as _requests_mod
+_yf_session = _requests_mod.Session()
+_yf_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+})
+
 
 # =============================================================================
 # RAG 模块：构建 FAISS 向量库（双保险嵌入引擎）
@@ -736,7 +757,7 @@ def get_stock_metrics(ticker: str) -> dict:
     info = None
     if forward_pe is None or peg is None:
         try:
-            info = yf.Ticker(ticker).info
+            info = yf.Ticker(ticker, session=_yf_session).info
         except Exception:
             info = {}
 
@@ -782,7 +803,7 @@ def get_stock_metrics(ticker: str) -> dict:
 def get_one_stock_row(ticker: str) -> dict:
     try:
         metrics = get_stock_metrics(ticker)
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=_yf_session)
         info = stock.info
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         prev_close = info.get("previousClose")
@@ -849,6 +870,7 @@ def fetch_history(tickers: list, period: str) -> pd.DataFrame:
         hist = yf.download(
             tickers, period=period, auto_adjust=True,
             progress=False, group_by="ticker", threads=False,
+            session=_yf_session,
         )
         if hist.empty:
             return pd.DataFrame()
