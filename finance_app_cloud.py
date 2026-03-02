@@ -76,7 +76,7 @@ import altair as alt
 from crewai import Agent, Task, Crew, Process
 from langchain_openai import ChatOpenAI  # 镜像本地版做法：ChatOpenAI 是纯 LangChain 对象，CrewAI 直接调用，完全不经过 LiteLLM 路由
 from crewai.tools import BaseTool
-from duckduckgo_search import DDGS          # 直接使用原生库，绕过 langchain_community 版本兼容问题
+from langchain_community.tools import DuckDuckGoSearchRun
 from pydantic import BaseModel, Field
 from typing import Type
 
@@ -102,7 +102,7 @@ if sys.platform == "win32":
 # 这是 run_crewai_analysis() 函数开头 "_pre_search_block" 的由来。
 # =============================================================================
 
-# DuckDuckGo 搜索使用原生 DDGS，按需在调用处实例化，无需模块级初始化
+_ddg_runner = DuckDuckGoSearchRun()
 
 # 预定义的6条搜索计划：(公司标识, 搜索词)
 _PLANNED_SEARCHES: list = [
@@ -168,7 +168,7 @@ def _make_groq_llm():
     os.environ["OPENAI_BASE_URL"] = "https://api.groq.com/openai/v1"  # openai SDK >= 1.x 读此变量
     os.environ["GROQ_API_KEY"]    = GROQ_API_KEY
     return ChatOpenAI(
-        model="llama-3.1-8b-instant",
+        model="llama-3.3-70b-versatile",
         base_url="https://api.groq.com/openai/v1",
         api_key=GROQ_API_KEY,
         temperature=0.1,
@@ -272,17 +272,19 @@ def get_embedding_function(engine_choice: str = "auto"):
             st.sidebar.warning(msg + "，自动切换 HuggingFace")
 
     # ── HuggingFace Inference API ──────────────────────────────────────────
+    # 使用 BAAI/bge-m3：支持中英文跨语言检索（8192 token 上限），
+    # 优于 all-MiniLM-L6-v2（仅 256 token 且不支持中文查询）。
     if use_hf and HF_TOKEN:
         try:
             from langchain_huggingface import HuggingFaceEndpointEmbeddings
-            # 使用多语言模型，支持中英文混合 PDF 内容
-            # all-MiniLM-L6-v2 为纯英文模型，会导致中文 PDF 检索质量极差
             embeddings = HuggingFaceEndpointEmbeddings(
-                model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                model="BAAI/bge-m3",
                 huggingfacehub_api_token=HF_TOKEN,
+                # timeout 参数已移除：HuggingFaceEndpointEmbeddings 当前版本
+                # Pydantic schema 不接受此参数（extra_forbidden），传入会直接报错
             )
             embeddings.embed_query("test")
-            return embeddings, "HuggingFace Inference API (multilingual-MiniLM-L12-v2)"
+            return embeddings, "HuggingFace Inference API (BAAI/bge-m3)"
         except Exception as e:
             st.sidebar.warning(f"⚠️ HuggingFace 嵌入引擎失败：{e}")
 
@@ -585,7 +587,7 @@ def build_rag_vectorstore(uploaded_pdf_files=None, engine_choice: str = "auto"):
     if not all_docs:
         return None
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=80)
     chunks = splitter.split_documents(all_docs)
     if not chunks:
         return None
@@ -602,6 +604,7 @@ def build_rag_vectorstore(uploaded_pdf_files=None, engine_choice: str = "auto"):
     st.sidebar.caption(f"🔌 嵌入引擎：{embed_source}")
 
     # Google Gemini 免费层限速保护：每 chunk 间隔 0.65s，chunk 数量较多时需要等待
+    # chunk_size=800 相比原来的 500 减少约 37% 的 chunk 数量，降低 RPD 消耗
     # 例：30 个 chunk 约需 20s，60 个 chunk 约需 40s，属正常现象
     is_gemini = "Google Gemini" in embed_source
     chunk_count = len(chunks)
@@ -611,32 +614,31 @@ def build_rag_vectorstore(uploaded_pdf_files=None, engine_choice: str = "auto"):
             f"⏳ Google Gemini 免费层限速保护已启用（{chunk_count} 个 chunk，"
             f"预计约 {est_sec}s）。请耐心等待，勿重复点击。"
         )
+
     try:
         vectorstore = FAISS.from_documents(chunks, embeddings)
-        return vectorstore
     except Exception as e:
-        err_str = str(e)
-        is_quota = any(k in err_str.upper() for k in ("429", "QUOTA", "RESOURCE_EXHAUSTED", "RATE"))
-        if is_quota:
+        # ── Gemini 构建过程中额度耗尽，自动降级到 HuggingFace ──────────────
+        err_str = str(e).upper()
+        is_quota_error = any(k in err_str for k in ("429", "QUOTA", "RESOURCE_EXHAUSTED", "RATE"))
+        if is_gemini and is_quota_error and HF_TOKEN:
             st.sidebar.warning(
-                f"⚠️ Gemini 免费层配额已用完，自动切换 HuggingFace 重试…\n\n"
-                f"（原始错误：{err_str[:120]}）"
+                f"⚠️ Gemini 额度在构建过程中耗尽，自动切换 HuggingFace 重新构建知识库…"
             )
+            fallback_emb, fallback_src = get_embedding_function(engine_choice="huggingface")
+            if fallback_emb is None:
+                st.warning("⚠️ HuggingFace 降级也失败，知识库构建中止。")
+                return None
+            st.sidebar.caption(f"🔌 嵌入引擎（降级）：{fallback_src}")
+            try:
+                vectorstore = FAISS.from_documents(chunks, fallback_emb)
+            except Exception as e2:
+                st.warning(f"⚠️ 知识库构建失败（HuggingFace 降级后仍出错）：{e2}")
+                return None
         else:
-            st.sidebar.warning(f"⚠️ 嵌入引擎构建失败：{err_str[:120]}，尝试切换备用引擎…")
-
-        # 自动切换到另一个引擎
-        fallback_engine = "huggingface" if "Google Gemini" in embed_source else "gemini"
-        embeddings_fb, embed_source_fb = get_embedding_function(engine_choice=fallback_engine)
-        if embeddings_fb is None:
-            st.warning(
-                "⚠️ 主引擎与备用引擎均不可用，知识库构建失败。\n"
-                "请检查 HF_TOKEN 是否已在 secrets.toml 中配置。"
-            )
+            st.warning(f"⚠️ 知识库构建失败：{e}")
             return None
-        st.sidebar.caption(f"🔌 已自动切换至备用引擎：{embed_source_fb}")
-        vectorstore = FAISS.from_documents(chunks, embeddings_fb)
-        return vectorstore
+    return vectorstore
 
 
 # =============================================================================
@@ -926,20 +928,28 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
 
     # ── Python 层双轨 RAG 预取 ─────────────────────────────────────────────
     RAG_CHUNK_CHARS = 220
-    RAG_MAX_CHUNKS  = 2
+    RAG_MAX_CHUNKS  = 3
 
     def _rag_search(vs, queries, k=2, max_chunks=RAG_MAX_CHUNKS):
-        import re as _re
         seen, chunks = set(), []
 
-        def _is_low_quality(text: str) -> bool:
-            """过滤纯数字/表格/乱码 chunk，防止污染 LLM prompt。"""
-            stripped = text.strip()
-            if len(stripped) < 20:
+        def _is_noisy_chunk(text: str) -> bool:
+            """过滤器：跳过 URL、邮箱、元数据页等低质量 chunk。"""
+            if re.search(r"https?://", text):          # 含 URL
                 return True
-            # 数字和符号占比超过 60% 视为低质量（财务表格原始数据）
-            non_text = len(_re.sub(r'[\u4e00-\u9fffA-Za-z]', '', stripped))
-            if non_text / max(len(stripped), 1) > 0.6:
+            if re.search(r"[\w.+-]+@[\w-]+\.\w+", text):  # 含邮箱
+                return True
+            noisy_phrases = (
+                "download", "contact", "investor relations",
+                "press release", "table of contents", "click here",
+                "copyright ©", "all rights reserved",
+            )
+            lower = text.lower()
+            if sum(1 for p in noisy_phrases if p in lower) >= 2:  # ≥2 个噪音词
+                return True
+            # 有效词（长度≥3 的词）不足 15 个，视为稀疏/元数据页
+            meaningful_words = [w for w in text.split() if len(w) >= 3]
+            if len(meaningful_words) < 15:
                 return True
             return False
 
@@ -947,9 +957,9 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             for doc in vs.similarity_search(q, k=k):
                 key = doc.page_content[:80]
                 if key not in seen:
+                    if _is_noisy_chunk(doc.page_content):
+                        continue  # 跳过噪音 chunk
                     seen.add(key)
-                    if _is_low_quality(doc.page_content):
-                        continue
                     src = doc.metadata.get("source", "未知").replace("\\", "/").split("/")[-1]
                     page = doc.metadata.get("page", "?")
                     page_label = page + 1 if isinstance(page, int) else page
@@ -959,30 +969,29 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
                     chunks.append(f"[{src} p{page_label}] {body}")
         return chunks[:max_chunks]
 
-    rag_philosophy_text = ""
+    # ── RAG 搜索：按公司分组，从英文季报中提取财务亮点与风险因子 ────────────
+    # 知识库内容为3家公司的英文季报（约10页/份），无投资哲学类内容。
+    # 查询词使用英文财报关键词，按公司分组检索，确保每家公司都有相关内容。
+    # rag_philosophy 已废弃：中文哲学词汇无法匹配英文季报，改由模型自身知识提供。
     rag_annual_report_text = ""
     vs = st.session_state.get("rag_vectorstore")
     if vs is not None:
         try:
-            phil_chunks = _rag_search(vs, [
-                "护城河 竞争优势 优秀企业 定价权 买入并持有",
-                "安全边际 内在价值 复利 长期持有",
-                "能力圈 心智模型 理性 避免愚蠢",
-            ])
             ar_chunks = _rag_search(vs, [
-                "revenue operating income free cash flow AI capital expenditure",
-                "risk factors antitrust regulatory advertising cloud competition",
-            ])
-            phil_keys = {c[:80] for c in phil_chunks}
-            ar_chunks = [c for c in ar_chunks if c[:80] not in phil_keys]
-            rag_philosophy_text    = "\n\n---\n\n".join(phil_chunks) if phil_chunks else "（未检索到投资哲学相关内容）"
-            rag_annual_report_text = "\n\n---\n\n".join(ar_chunks)   if ar_chunks   else "（未检索到财报相关内容）"
+                # Meta 相关
+                "Meta revenue advertising AI Reality Labs capital expenditure",
+                # Amazon 相关
+                "Amazon AWS cloud revenue operating income free cash flow",
+                # Google 相关
+                "Google Alphabet search revenue cloud Gemini AI operating income",
+                # 通用风险/展望
+                "risk factors competition regulation antitrust outlook guidance",
+            ], k=2, max_chunks=6)
+            rag_annual_report_text = "\n\n---\n\n".join(ar_chunks) if ar_chunks else "（未检索到季报相关内容）"
         except Exception as e:
-            rag_philosophy_text = rag_annual_report_text = f"（知识库检索出错：{e}）"
+            rag_annual_report_text = f"（知识库检索出错：{e}）"
     else:
-        rag_philosophy_text = rag_annual_report_text = "（知识库为空，请先构建知识库）"
-
-    rag_context_text = rag_philosophy_text
+        rag_annual_report_text = "（知识库为空，季报补充数据不可用）"
 
     # ── Python 层预计算风险标注 ────────────────────────────────────────────
     risk_notes_lines = []
@@ -1077,12 +1086,8 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             f"🔍 搜索进度：**{_idx}/6** | 公司：{_co} | 查询：`{_q}`"
         )
         try:
-            with DDGS() as _ddgs:
-                _results = _ddgs.text(_q, max_results=5)
-            _snippet = "\n".join(
-                f"{r.get('title', '')}: {r.get('body', '')}"
-                for r in (_results or [])
-            ) or "(no result)"
+            _raw = _ddg_runner.run(_q)
+            _snippet = str(_raw or "(no result)")
             if len(_snippet) > 600:
                 _snippet = _snippet[:600] + "...[截断]"
         except Exception as _e:
@@ -1199,33 +1204,28 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
     )
 
     # ── RAG 注入文本 ───────────────────────────────────────────────────────
-    _phil_content = rag_philosophy_text.strip()
-    _ar_content   = rag_annual_report_text.strip()
-    rag_inject_philosophy = (
-        "\n[芒格原则摘要] " + _phil_content[:500] + "\n"
-        if _phil_content and not _phil_content.startswith("（") else ""
-    )
+    # 只注入季报财务数据，不再注入哲学类内容（季报中不存在此类内容）。
+    # [:1200] 避免 3 个 chunk × 400 字符被硬截断成残缺引用（如 "[t"）。
+    _ar_content = rag_annual_report_text.strip()
     rag_inject_annual_report = (
-        "\n[财报关键数据] " + _ar_content[:500] + "\n"
+        _ar_content[:1200]
         if _ar_content and not _ar_content.startswith("（") else ""
     )
 
     # ── Python 层预建财务对比表 ────────────────────────────────────────────
     metrics_table_md = ""
     if df is not None and not df.empty:
-        def _v(row, col):
-            """从 row 中安全取值，None/NaN 返回 N/A。"""
-            val = row.get(col)
-            if val is None or (isinstance(val, float) and pd.isna(val)):
-                return "N/A"
-            return str(val)
-
         rows_md = []
         for _, row in df.iterrows():
+            def _v(col):
+                val = row.get(col)
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return "N/A"
+                return str(val)
             rows_md.append(
-                f"| {_v(row,'股票代码')} | {_v(row,'Forward P/E')} | {_v(row,'PEG Ratio (5yr)')} "
-                f"| {_v(row,'ROE (%)')} | {_v(row,'Operating Margin (%)')} "
-                f"| {_v(row,'D/E (%)')} | {_v(row,'FCF (B)')} | {_v(row,'Current Ratio')} |"
+                f"| {_v('股票代码')} | {_v('Forward P/E')} | {_v('PEG Ratio (5yr)')} "
+                f"| {_v('ROE (%)')} | {_v('Operating Margin (%)')} "
+                f"| {_v('D/E (%)')} | {_v('FCF (B)')} | {_v('Current Ratio')} |"
             )
         metrics_table_md = (
             "| 股票代码 | Forward P/E | PEG | ROE | Operating Margin | D/E (%) | FCF | Current Ratio |\n"
@@ -1376,8 +1376,7 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
 
     task_report = Task(
         description=(
-            rag_inject_philosophy
-            + "任务：制定 $10,000 / 20年视野的 META、AMZN、GOOG 长线组合。\n"
+            "任务：制定 $10,000 / 20年视野的 META、AMZN、GOOG 长线组合。\n"
             "比例和金额已由系统计算完毕，禁止修改数字。\n"
             "只需：① 第1节填投资逻辑标签和信心指数；② 第2节写持仓理由和风险。\n\n"
 
@@ -1395,7 +1394,14 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             "例如：META信心85、谷歌信心95，两者都是高确信，但谷歌的FCF和ROE双项第一，\n"
             "导致量化分配比例差距较大——这是正常且合理的，请如实填写，不要为追求一致性而虚报。\n\n"
 
-            "**报告格式（必须完整输出）**\n"
+            + (
+                "【季报补充数据（仅供第2节持仓逻辑参考，不影响报告结构和数字）】\n"
+                f"{rag_inject_annual_report}\n"
+                "【季报补充数据结束，请勿续写以上内容，立即按下方格式输出完整报告】\n\n"
+                if rag_inject_annual_report else ""
+            )
+
+            + "**报告格式（必须完整输出）**\n"
 
             "### 1. 💰 最终资金分配方案\n"
             "以下表格比例和金额已由系统精确计算，**禁止修改任何数字**，"
@@ -1403,8 +1409,7 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             + alloc_skeleton + "\n"
 
             "\n### 2. 深度持仓逻辑\n"
-            + rag_inject_annual_report
-            + "请严格按以下三节结构输出，每节标题固定，禁止更改：\n\n"
+            "请严格按以下三节结构输出，每节标题固定，禁止更改：\n\n"
             "#### Meta（META）\n"
             "持仓理由：（结合ROE排名、Operating Margin护城河、广告平台网络效应）\n"
             "最大毁灭性风险：（一句话）\n\n"
@@ -1420,9 +1425,7 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             + metrics_table_md + "\n\n"
 
             "\n### 4. 首席投资官总结\n"
-            "一句话概括组合策略，引用一条芒格/格雷厄姆经典观点"
-            "（若上方有[芒格原则摘要]则优先引用；否则直接引用你熟知的芒格/格雷厄姆原则，"
-            "无需提及知识库或摘要来源）。"
+            "一句话概括组合策略，并引用一条你熟知的芒格或格雷厄姆经典投资原则。\n"
         ),
         expected_output="按报告格式完整输出上述四节内容，数字禁止修改，公司名称使用规定格式。",
         agent=chief_strategist,
@@ -1493,71 +1496,6 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             "2. 检查 Groq API 密钥是否有效\n\n"
             f"**原始输出（供调试）：**\n```json\n{stripped[:500]}\n```"
         )
-        return final_text
-
-    # ── 后处理：强制重排章节顺序，去除 RAG 前导内容 ──────────────────────
-    import re as _re
-
-    def _reorder_report_sections(text: str) -> str:
-        """
-        LLM 有时不按 1→2→3→4→5 顺序输出，且会把 RAG 摘要/上下文内容
-        直接渲染在报告开头。此函数：
-        1. 按 ### 1 / ### 2 / ### 3 / ### 4 / ### 5 分割章节
-        2. 丢弃第 1 节之前的所有前导内容（RAG 泄漏、乱序片段等）
-        3. 按 1→2→3→4→5 重新拼接
-        """
-        # 匹配 "### 1." 或 "### 1 " 或 "## 1." 等形式的章节标题
-        section_pattern = _re.compile(
-            r'(?=^#{1,3}\s*\d+[\.。]?\s)', _re.MULTILINE
-        )
-        # 用更宽松的方式找各节起始位置
-        markers = list(_re.finditer(
-            r'^(#{1,3})\s*(\d+)[\.。]?\s', text, _re.MULTILINE
-        ))
-        if not markers:
-            return text  # 找不到章节标记，原样返回
-
-        sections = {}
-        for i, m in enumerate(markers):
-            sec_num = int(m.group(2))
-            start = m.start()
-            end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
-            # 同一节号只保留首次出现（避免重复节）
-            if sec_num not in sections:
-                sections[sec_num] = text[start:end].rstrip()
-
-        if not sections:
-            return text
-
-        # 按 1→2→3→4→5 顺序输出，缺失的节跳过
-        ordered_keys = sorted(sections.keys())
-        return "\n\n".join(sections[k] for k in ordered_keys)
-
-    try:
-        final_text = _reorder_report_sections(final_text)
-    except Exception:
-        pass  # 后处理失败时保留原始输出，不影响主流程
-
-    # ── 第二层保障：用 Python 生成的表格强制替换第3节 ─────────────────────
-    # LLM 经常在"原样输出"表格时丢失数值，此处直接覆盖，确保数据准确。
-    if metrics_table_md and metrics_table_md != "（数据不可用）":
-        section3_header = "### 3. 关键财务指标对比"
-        section3_block  = section3_header + "\n" + metrics_table_md + "\n\n"
-
-        # 策略1：找到第3节标题，替换到下一个 ### 节之前
-        m3 = _re.search(r'#{1,3}\s*3[\.。]?\s*关键财务指标对比', final_text)
-        m4 = _re.search(r'#{1,3}\s*4[\.。]?\s', final_text)
-        if m3:
-            start = m3.start()
-            end   = m4.start() if m4 and m4.start() > start else len(final_text)
-            final_text = final_text[:start] + section3_block + final_text[end:]
-        else:
-            # 策略2：第3节完全缺失，插入到第4节之前；若第4节也没有则直接追加
-            if m4:
-                final_text = final_text[:m4.start()] + section3_block + final_text[m4.start():]
-            else:
-                final_text = final_text.rstrip() + "\n\n" + section3_block
-
     return final_text
 
 
