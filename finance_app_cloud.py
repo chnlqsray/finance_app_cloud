@@ -1536,6 +1536,21 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
     except Exception:
         pass  # 后处理失败时保留原始输出，不影响主流程
 
+    # ── 第二层保障：用 Python 生成的表格强制替换第3节 ─────────────────────
+    # LLM 经常在"原样输出"表格时丢失数值，此处直接覆盖，确保数据准确。
+    if metrics_table_md and metrics_table_md != "（数据不可用）":
+        section3_block = (
+            "### 3. 关键财务指标对比\n"
+            + metrics_table_md
+        )
+        # 替换 LLM 输出中的第3节（无论其内容是否完整）
+        final_text = _re.sub(
+            r'(#{1,3}\s*3[\.。]?\s*关键财务指标对比.*?)(?=#{1,3}\s*4[\.。]?|$)',
+            section3_block + "\n\n",
+            final_text,
+            flags=_re.DOTALL
+        )
+
     return final_text
 
 
