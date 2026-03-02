@@ -70,6 +70,7 @@ from bs4 import BeautifulSoup
 
 import streamlit as st
 import pandas as pd
+import yfinance as yf
 import altair as alt
 
 from crewai import Agent, Task, Crew, Process
@@ -128,13 +129,11 @@ def _get_secret(key: str) -> str:
 GROQ_API_KEY    = _get_secret("GROQ_API_KEY")
 GEMINI_API_KEY  = _get_secret("GEMINI_API_KEY")
 HF_TOKEN        = _get_secret("HF_TOKEN")
-FMP_API_KEY     = _get_secret("FMP_API_KEY")
 
-# API 状态（用于侧边栏指示灯）
+# Groq API 状态（用于侧边栏指示灯）
 _GROQ_READY   = bool(GROQ_API_KEY)
 _GEMINI_READY = bool(GEMINI_API_KEY)
 _HF_READY     = bool(HF_TOKEN)
-_FMP_READY    = bool(FMP_API_KEY)
 
 
 # =============================================================================
@@ -539,93 +538,6 @@ PERIOD_OPTIONS = [
 
 
 # =============================================================================
-# 【FMP 数据层】Financial Modeling Prep API — /stable/ 接口（2025年8月后新版）
-# =============================================================================
-# /v3/ 旧接口已于2025年8月31日对新用户关闭，必须使用 /stable/ 路径。
-# 参数传递方式也从路径参数（/quote/META）改为查询参数（/quote?symbol=META）。
-# =============================================================================
-
-_FMP_BASE = "https://financialmodelingprep.com/stable"
-_fmp_session = requests.Session()
-_fmp_session.headers.update({"Accept": "application/json"})
-
-
-def _fmp_get(path: str, params: dict = None) -> list | dict | None:
-    """FMP REST API 通用请求，失败返回 None。"""
-    if not FMP_API_KEY:
-        return None
-    p = dict(params or {})
-    p["apikey"] = FMP_API_KEY
-    try:
-        resp = _fmp_session.get(f"{_FMP_BASE}{path}", params=p, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, dict) and "Error Message" in data:
-            return None
-        return data
-    except Exception:
-        return None
-
-
-def _fmp_quote(ticker: str) -> dict:
-    """实时报价：price、changePercentage、previousClose。"""
-    data = _fmp_get("/quote", {"symbol": ticker})
-    if data and isinstance(data, list) and len(data) > 0:
-        return data[0]
-    return {}
-
-
-def _fmp_ratios_ttm(ticker: str) -> dict:
-    """TTM 财务比率：Operating Margin、P/B、D/E、Current Ratio、EPS、P/E、PEG。
-    实测字段名（/stable/ratios-ttm）：
-      operatingProfitMarginTTM、priceToBookRatioTTM、debtToEquityRatioTTM、
-      currentRatioTTM、netIncomePerShareTTM、priceToEarningsRatioTTM、
-      priceToEarningsGrowthRatioTTM
-    """
-    data = _fmp_get("/ratios-ttm", {"symbol": ticker})
-    if data and isinstance(data, list) and len(data) > 0:
-        return data[0]
-    return {}
-
-
-def _fmp_key_metrics_ttm(ticker: str) -> dict:
-    """TTM 关键指标：ROE（returnOnEquityTTM）。
-    ratios-ttm 不含 ROE，需从 key-metrics-ttm 单独获取。
-    """
-    data = _fmp_get("/key-metrics-ttm", {"symbol": ticker})
-    if data and isinstance(data, list) and len(data) > 0:
-        return data[0]
-    return {}
-
-
-def _fmp_cashflow(ticker: str) -> float | None:
-    """最近一期年报自由现金流（原始美元）。"""
-    data = _fmp_get("/cash-flow-statement", {"symbol": ticker, "limit": 1})
-    if data and isinstance(data, list) and len(data) > 0:
-        v = data[0].get("freeCashFlow")
-        return float(v) if v is not None else None
-    return None
-
-
-def _fmp_history(ticker: str, timeseries: int) -> pd.Series:
-    """/stable/historical-price-eod/full 直接返回列表（非 historical 嵌套）。"""
-    data = _fmp_get("/historical-price-eod/full",
-                    {"symbol": ticker, "timeseries": timeseries})
-    if not data:
-        return pd.Series(dtype=float, name=ticker)
-    # 新接口直接返回 list，旧接口返回 {"historical": [...]}
-    rows = data if isinstance(data, list) else data.get("historical", [])
-    if not rows:
-        return pd.Series(dtype=float, name=ticker)
-    df = pd.DataFrame(rows)
-    if "date" not in df.columns or "close" not in df.columns:
-        return pd.Series(dtype=float, name=ticker)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").set_index("date")
-    return df["close"].rename(ticker)
-
-
-# =============================================================================
 # RAG 模块：构建 FAISS 向量库（双保险嵌入引擎）
 # =============================================================================
 
@@ -812,8 +724,8 @@ def get_stock_metrics(ticker: str) -> dict:
     """
     三重保障获取 Forward P/E 与 PEG Ratio。
     第一优先级：爬虫（BeautifulSoup）→ 'Web Scraper'
-    第二优先级：FMP ratios-ttm（TTM PE / PEG）→ 'FMP API'
-    第三优先级（仅 Forward P/E）：FMP quote price / FMP ratios forwardPE → 'FMP Calculated'
+    第二优先级：yfinance API → 'yfinance API'
+    第三优先级（仅 Forward P/E）：currentPrice / forwardEps → 'Calculated'
     """
     fpe_str, peg_str = fetch_key_stats(ticker)
     forward_pe = _parse_metric(fpe_str)
@@ -821,31 +733,41 @@ def get_stock_metrics(ticker: str) -> dict:
     source_fpe = "Web Scraper" if forward_pe is not None else None
     source_peg = "Web Scraper" if peg is not None else None
 
-    # FMP 兜底
+    info = None
     if forward_pe is None or peg is None:
-        ratios = _fmp_ratios_ttm(ticker)
-        if forward_pe is None:
-            raw = ratios.get("priceToEarningsRatioTTM")  # 实测字段名
-            if raw is not None:
-                try:
-                    forward_pe = round(float(raw), 2)
-                    source_fpe = "FMP API"
-                except (TypeError, ValueError):
-                    pass
-        if peg is None:
-            raw = ratios.get("priceToEarningsGrowthRatioTTM")  # 实测字段名
-            if raw is not None:
-                try:
-                    v = round(float(raw), 2)
-                    # 合理性过滤：PEG 在 0.1~20 范围外视为无效
-                    if 0.1 <= v <= 20:
-                        peg = v
-                        source_peg = "FMP API"
-                except (TypeError, ValueError):
-                    pass
+        try:
+            info = yf.Ticker(ticker).info
+        except Exception:
+            info = {}
 
+    if forward_pe is None and info:
+        raw = info.get("forwardPE") or info.get("priceEpsCurrentYear")
+        if raw is not None:
+            try:
+                forward_pe = round(float(raw), 2)
+                source_fpe = "yfinance API"
+            except (TypeError, ValueError):
+                pass
+    if forward_pe is None and info:
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        forward_eps = info.get("forwardEps")
+        if price is not None and forward_eps is not None and forward_eps != 0:
+            try:
+                forward_pe = round(price / float(forward_eps), 2)
+                source_fpe = "Calculated"
+            except (TypeError, ValueError):
+                pass
     if source_fpe is None:
         source_fpe = "N/A"
+
+    if peg is None and info:
+        raw = info.get("pegRatio") or info.get("trailingPegRatio")
+        if raw is not None:
+            try:
+                peg = round(float(raw), 2)
+                source_peg = "yfinance API"
+            except (TypeError, ValueError):
+                pass
     if source_peg is None:
         source_peg = "N/A"
 
@@ -859,49 +781,38 @@ def get_stock_metrics(ticker: str) -> dict:
 
 def get_one_stock_row(ticker: str) -> dict:
     try:
-        metrics    = get_stock_metrics(ticker)
-        quote      = _fmp_quote(ticker)
-        ratios     = _fmp_ratios_ttm(ticker)
-        key_metrics = _fmp_key_metrics_ttm(ticker)   # ROE 在此接口
-        fcf_raw    = _fmp_cashflow(ticker)
-
-        price      = _safe_float(quote.get("price"))
-        prev_close = _safe_float(quote.get("previousClose"))
-        daily_pct  = (
+        metrics = get_stock_metrics(ticker)
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        prev_close = info.get("previousClose")
+        daily_pct = (
             round((price - prev_close) / prev_close * 100, 2)
             if price is not None and prev_close and prev_close != 0
-            else _safe_float(quote.get("changePercentage"))  # 实测字段名
+            else None
         )
-
-        # ROE 来自 key-metrics-ttm（ratios-ttm 不含此字段）
-        roe_raw = _safe_float(key_metrics.get("returnOnEquityTTM"))
+        roe_raw = _safe_float(info.get("returnOnEquity"))
         roe_pct = round(roe_raw * 100, 2) if roe_raw is not None else None
-
-        # Operating Margin 实测字段名
-        om_raw  = _safe_float(ratios.get("operatingProfitMarginTTM"))
-        om_pct  = round(om_raw * 100, 2) if om_raw is not None else None
-
-        pb  = _safe_float(ratios.get("priceToBookRatioTTM"))       # ✅ 实测可用
-        de  = _safe_float(ratios.get("debtToEquityRatioTTM"))      # 实测字段名（非 debtEquityRatio）
-        cr  = _safe_float(ratios.get("currentRatioTTM"))           # ✅ 实测可用
-        eps = _safe_float(ratios.get("netIncomePerShareTTM"))      # quote.eps=None，改用 ratios
-
+        om_raw = info.get("operatingMargins")
+        if isinstance(om_raw, dict):
+            om_raw = list(om_raw.values())[0] if om_raw else None
+        om_pct = round(_safe_float(om_raw) * 100, 2) if _safe_float(om_raw) is not None else None
         data_source = f"FPE: {metrics['source_forward_pe']} | PEG: {metrics['source_peg']}"
         return {
-            "股票代码":             ticker,
-            "最新价 (USD)":         round(price, 2)      if price    is not None else None,
-            "日涨跌幅 (%)":         round(daily_pct, 2)  if daily_pct is not None else None,
-            "Forward P/E":          metrics["forward_pe"],
-            "PEG Ratio (5yr)":      metrics["peg"],
-            "P/B":                  round(pb,  2) if pb  is not None else None,
-            "ROE (%)":              roe_pct,
+            "股票代码": ticker,
+            "最新价 (USD)": round(price, 2) if price is not None else None,
+            "日涨跌幅 (%)": daily_pct,
+            "Forward P/E": metrics["forward_pe"],
+            "PEG Ratio (5yr)": metrics["peg"],
+            "P/B": round(_safe_float(info.get("priceToBook")), 2) if _safe_float(info.get("priceToBook")) is not None else None,
+            "ROE (%)": roe_pct,
             "Operating Margin (%)": om_pct,
-            "EPS (Trailing) ($)":   round(eps, 2) if eps is not None else None,
-            "D/E (%)":              round(de,  2) if de  is not None else None,
-            "FCF (B)":              _format_fcf_billions(fcf_raw),
-            "Current Ratio":        round(cr,  2) if cr  is not None else None,
-            "数据来源":             data_source,
-            "_info": {},
+            "EPS (Trailing) ($)": round(_safe_float(info.get("trailingEps")), 2) if _safe_float(info.get("trailingEps")) is not None else None,
+            "D/E (%)": round(_safe_float(info.get("debtToEquity")), 2) if _safe_float(info.get("debtToEquity")) is not None else None,
+            "FCF (B)": _format_fcf_billions(info.get("freeCashflow")),
+            "Current Ratio": round(_safe_float(info.get("currentRatio")), 2) if _safe_float(info.get("currentRatio")) is not None else None,
+            "数据来源": data_source,
+            "_info": info,
         }
     except Exception:
         return {
@@ -932,21 +843,23 @@ def fetch_stock_data(tickers: list) -> tuple:
 
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_history(tickers: list, period: str) -> pd.DataFrame:
-    """用 FMP historical-price-full 替代 yf.download，不受云端 IP 封锁影响。"""
     if not tickers:
         return pd.DataFrame()
-    # 将 yfinance period 字符串映射为 FMP timeseries 天数
-    _period_map = {"1d": 5, "5d": 7, "1mo": 35, "6mo": 185, "1y": 370}
-    timeseries = _period_map.get(period, 370)
-    series_list = []
-    for ticker in tickers:
-        s = _fmp_history(ticker, timeseries)
-        if not s.empty:
-            series_list.append(s)
-    if not series_list:
+    try:
+        hist = yf.download(
+            tickers, period=period, auto_adjust=True,
+            progress=False, group_by="ticker", threads=False,
+        )
+        if hist.empty:
+            return pd.DataFrame()
+        if isinstance(hist.columns, pd.MultiIndex):
+            close = hist.xs("Close", axis=1, level=1).copy()
+        else:
+            close = hist[["Close"]].copy() if "Close" in hist.columns else hist.iloc[:, :1].copy()
+            close.columns = [tickers[0]]
+        return close.ffill().dropna(how="all")
+    except Exception:
         return pd.DataFrame()
-    df = pd.concat(series_list, axis=1)
-    return df.ffill().dropna(how="all")
 
 
 def calc_period_returns(hist_df: pd.DataFrame) -> pd.DataFrame:
@@ -1630,7 +1543,6 @@ def _status_badge(ready: bool, label: str) -> str:
 st.sidebar.markdown(_status_badge(_GROQ_READY,   "Groq API Key"))
 st.sidebar.markdown(_status_badge(_GEMINI_READY, "Gemini API Key"))
 st.sidebar.markdown(_status_badge(_HF_READY,     "HuggingFace Token"))
-st.sidebar.markdown(_status_badge(_FMP_READY,    "FMP API Key"))
 
 if not _GROQ_READY:
     st.sidebar.error("⚠️ GROQ_API_KEY 未配置，AI 分析功能将无法使用。")
@@ -1693,7 +1605,7 @@ else:
 # 主界面
 # =============================================================================
 st.title("📈 美股关键指标")
-st.caption("数据来源：Financial Modeling Prep (FMP) API。Forward P/E 与 PEG 采用双重保障：爬虫 → FMP API；表格中「数据来源」列标明每个数值的来源。")
+st.caption("数据来源：Yahoo Finance。Forward P/E 与 PEG 采用三重保障：爬虫 → yfinance API → 手动计算；表格中「数据来源」列标明每个数值的来源。")
 
 if not all_tickers:
     st.warning("请在左侧至少选择一只股票或输入自选股代码。")
@@ -1811,4 +1723,4 @@ if not period_df.empty:
     st.caption(f"时间范围：{selected_period_label}（与上方走势图一致）")
     st.dataframe(period_df, width="stretch", hide_index=True)
 
-st.caption("双重保障：① Web Scraper = Key Statistics 页爬虫 ② FMP API = ratios-ttm / quote 接口。价格、ROE、FCF 等全部来自 FMP。")
+st.caption("三重保障：① Web Scraper = Key Statistics 页爬虫 ② yfinance API = info.forwardPE / pegRatio ③ Calculated = 最新价 ÷ forwardEps（仅 Forward P/E）。")
