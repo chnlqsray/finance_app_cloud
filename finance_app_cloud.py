@@ -611,8 +611,32 @@ def build_rag_vectorstore(uploaded_pdf_files=None, engine_choice: str = "auto"):
             f"⏳ Google Gemini 免费层限速保护已启用（{chunk_count} 个 chunk，"
             f"预计约 {est_sec}s）。请耐心等待，勿重复点击。"
         )
-    vectorstore = FAISS.from_documents(chunks, embeddings)
-    return vectorstore
+    try:
+        vectorstore = FAISS.from_documents(chunks, embeddings)
+        return vectorstore
+    except Exception as e:
+        err_str = str(e)
+        is_quota = any(k in err_str.upper() for k in ("429", "QUOTA", "RESOURCE_EXHAUSTED", "RATE"))
+        if is_quota:
+            st.sidebar.warning(
+                f"⚠️ Gemini 免费层配额已用完，自动切换 HuggingFace 重试…\n\n"
+                f"（原始错误：{err_str[:120]}）"
+            )
+        else:
+            st.sidebar.warning(f"⚠️ 嵌入引擎构建失败：{err_str[:120]}，尝试切换备用引擎…")
+
+        # 自动切换到另一个引擎
+        fallback_engine = "huggingface" if "Google Gemini" in embed_source else "gemini"
+        embeddings_fb, embed_source_fb = get_embedding_function(engine_choice=fallback_engine)
+        if embeddings_fb is None:
+            st.warning(
+                "⚠️ 主引擎与备用引擎均不可用，知识库构建失败。\n"
+                "请检查 HF_TOKEN 是否已在 secrets.toml 中配置。"
+            )
+            return None
+        st.sidebar.caption(f"🔌 已自动切换至备用引擎：{embed_source_fb}")
+        vectorstore = FAISS.from_documents(chunks, embeddings_fb)
+        return vectorstore
 
 
 # =============================================================================
