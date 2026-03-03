@@ -293,22 +293,6 @@ def get_embedding_function(engine_choice: str = "auto"):
 
 
 # =============================================================================
-# 【yfinance 云端适配】注入浏览器 User-Agent，降低 Yahoo IP 封锁概率
-# =============================================================================
-_yf_session = requests.Session()
-_yf_session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Connection": "keep-alive",
-})
-
-
-# =============================================================================
 # 【FMP Forward P/E 模块】仅用于获取 Forward P/E，其余指标仍由 yfinance 提供
 # =============================================================================
 # FMP /stable/ 接口（2025年8月后新用户专用路径）不封锁云端 IP，数据准确度优于 yfinance。
@@ -331,10 +315,13 @@ def _fmp_get_fpe(ticker: str) -> float | None:
     global _fmp_quota_exceeded
     if not FMP_API_KEY or _fmp_quota_exceeded:
         return None
+    # FMP 对 GOOG（C类股）数据不完整，映射到主要 ticker GOOGL 查询
+    _FMP_ALIAS = {"GOOG": "GOOGL"}
+    fmp_ticker = _FMP_ALIAS.get(ticker, ticker)
     try:
         resp = _fmp_session.get(
             f"{_FMP_BASE}/ratios-ttm",
-            params={"symbol": ticker, "apikey": FMP_API_KEY},
+            params={"symbol": fmp_ticker, "apikey": FMP_API_KEY},
             timeout=10,
         )
         # 429 = Too Many Requests / 配额耗尽
@@ -632,7 +619,7 @@ def get_stock_metrics(ticker: str) -> dict:
     yf_info = None
     if forward_pe is None or True:   # PEG 始终需要 yfinance
         try:
-            yf_info = yf.Ticker(ticker, session=_yf_session).info or {}
+            yf_info = yf.Ticker(ticker).info or {}
         except Exception:
             yf_info = {}
 
@@ -678,7 +665,7 @@ def get_one_stock_row(ticker: str) -> dict:
         info = metrics.get("_yf_info") or {}
         if not info:
             try:
-                info = yf.Ticker(ticker, session=_yf_session).info or {}
+                info = yf.Ticker(ticker).info or {}
             except Exception:
                 info = {}
 
@@ -747,7 +734,6 @@ def fetch_history(tickers: list, period: str) -> pd.DataFrame:
         hist = yf.download(
             tickers, period=period, auto_adjust=True,
             progress=False, group_by="ticker", threads=False,
-            session=_yf_session,
         )
         if hist.empty:
             return pd.DataFrame()
