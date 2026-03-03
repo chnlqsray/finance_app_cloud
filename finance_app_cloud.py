@@ -1,6 +1,6 @@
 """
 美股投资仪表盘 - 使用 Streamlit 展示股票关键指标与走势
-数据来源：Yahoo Finance（爬虫 + yfinance API + 手动计算，三重保障）
+数据来源：Forward P/E 使用 FMP API（额度耗尽时自动降级 yfinance），其余指标来自 yfinance
 集成 CrewAI 多角色 AI 团队：数据分析师、情报研究员、投资总监
 RAG 知识库（FAISS + 双保险嵌入引擎）、报告下载
 
@@ -66,7 +66,6 @@ import tempfile
 import glob
 import requests
 from datetime import datetime, timezone
-from bs4 import BeautifulSoup
 
 import streamlit as st
 import pandas as pd
@@ -129,11 +128,13 @@ def _get_secret(key: str) -> str:
 GROQ_API_KEY    = _get_secret("GROQ_API_KEY")
 GEMINI_API_KEY  = _get_secret("GEMINI_API_KEY")
 HF_TOKEN        = _get_secret("HF_TOKEN")
+FMP_API_KEY     = _get_secret("FMP_API_KEY")
 
-# Groq API 状态（用于侧边栏指示灯）
+# API 状态（用于侧边栏指示灯）
 _GROQ_READY   = bool(GROQ_API_KEY)
 _GEMINI_READY = bool(GEMINI_API_KEY)
 _HF_READY     = bool(HF_TOKEN)
+_FMP_READY    = bool(FMP_API_KEY)
 
 
 # =============================================================================
@@ -292,182 +293,72 @@ def get_embedding_function(engine_choice: str = "auto"):
 
 
 # =============================================================================
-# 【整合自 crawler.py】Yahoo Finance Key Statistics 爬虫
+# 【yfinance 云端适配】注入浏览器 User-Agent，降低 Yahoo IP 封锁概率
 # =============================================================================
-
-_CRAWLER_BASE_URLS = [
-    "https://uk.finance.yahoo.com/quote/{ticker}/key-statistics/",
-    "https://finance.yahoo.com/quote/{ticker}/key-statistics/",
-]
-
-_CRAWLER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+_yf_session = requests.Session()
+_yf_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
-}
-
-_LABEL_FORWARD_PE = "Forward P/E (current)"
-_LABEL_PEG = "PEG Ratio (5 yr expected)"
+    "Connection": "keep-alive",
+})
 
 
-def _get_value_from_sibling_or_cell(soup: BeautifulSoup, label: str) -> str:
-    """在 HTML 中精准定位标签文本，并取相邻/同行的数值。"""
-    for tr in soup.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 2:
-            continue
-        first_text = (tds[0].get_text() or "").strip()
-        if label in first_text or first_text == label:
-            val = (tds[1].get_text() or "").strip()
-            if val and val != "--":
-                return val
-    for tag in soup.find_all(string=re.compile(re.escape(label), re.I)):
-        parent = tag.parent if hasattr(tag, "parent") else None
-        if not parent:
-            continue
-        if parent.name == "td":
-            row = parent.find_parent("tr")
-            if row:
-                cells = row.find_all("td")
-                for i, c in enumerate(cells):
-                    if c == parent and i + 1 < len(cells):
-                        val = (cells[i + 1].get_text() or "").strip()
-                        if val and val != "--":
-                            return val
-        nxt = parent.find_next_sibling()
-        if nxt:
-            val = (nxt.get_text() or "").strip()
-            if val and val != "--" and re.search(r"[\d.,]+", val):
-                return val
-    return "N/A"
+# =============================================================================
+# 【FMP Forward P/E 模块】仅用于获取 Forward P/E，其余指标仍由 yfinance 提供
+# =============================================================================
+# FMP /stable/ 接口（2025年8月后新用户专用路径）不封锁云端 IP，数据准确度优于 yfinance。
+# 仅调用 /stable/ratios-ttm 一个接口，每只股票消耗 1 次日额度（免费层 250次/天）。
+# _fmp_quota_exceeded：运行时检测到 429/限额错误时置 True，后续自动降级为 yfinance。
+# =============================================================================
+_FMP_BASE = "https://financialmodelingprep.com/stable"
+_fmp_session = requests.Session()
+_fmp_session.headers.update({"Accept": "application/json"})
+_fmp_quota_exceeded = False   # 模块级标志，触发限额后整个会话降级为 yfinance
 
 
-def _get_value_from_json(html: str, keys: list) -> str:
-    """从页面内嵌 JSON 中按 key 提取 raw 或 fmt 数值。"""
-    try:
-        for key in keys:
-            m = re.search(rf'"{key}"\s*:\s*{{\s*"raw"\s*:\s*([0-9.]+)', html)
-            if m:
-                return m.group(1)
-            m = re.search(rf'"{key}"\s*:\s*{{\s*"fmt"\s*:\s*"([^"]+)"', html)
-            if m:
-                return m.group(1)
-    except Exception:
-        pass
-    return "N/A"
-
-
-def _get_forward_pe_from_html_regex(html: str) -> str:
-    """从 HTML 中按标签文本或 JSON 键名兜底提取 Forward P/E。"""
-    try:
-        for key in ("forwardPE", "priceEpsCurrentYear"):
-            block = re.search(rf'"{key}"\s*:\s*\{{[^}}]{{0,80}}}}', html)
-            if block:
-                sub = block.group(0)
-                m = re.search(r'"raw"\s*:\s*([0-9.]+)', sub)
-                if m:
-                    return m.group(1)
-                m = re.search(r'"fmt"\s*:\s*"([0-9.]+)"', sub)
-                if m:
-                    return m.group(1)
-        sd = re.search(r'"summaryDetail"\s*:\s*\{', html)
-        if sd:
-            start = sd.end()
-            end = min(start + 2500, len(html))
-            sub = html[start:end]
-            m = re.search(r'"forwardPE"\s*:\s*\{\s*"raw"\s*:\s*([0-9.]+)', sub)
-            if m:
-                return m.group(1)
-            m = re.search(r'"forwardPE"\s*:\s*\{\s*"fmt"\s*:\s*"([0-9.]+)"', sub)
-            if m:
-                return m.group(1)
-        m = re.search(
-            r"Forward\s*P/?\s*E\s*\(current\)[\s\S]{0,300}?([0-9]+[.,]?[0-9]*)",
-            html, re.IGNORECASE,
-        )
-        if m:
-            return m.group(1).replace(",", ".")
-        m = re.search(
-            r"Forward\s*P/E\s*\(current\)[\s\S]{0,200}?([0-9]+\.[0-9]+)",
-            html, re.IGNORECASE,
-        )
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return "N/A"
-
-
-def _get_peg_from_html_regex(html: str) -> str:
-    """从 HTML 中按标签文本兜底提取 PEG Ratio。"""
-    try:
-        m = re.search(
-            r"PEG\s*Ratio\s*\(5\s*yr\s*expected\)[\s\S]{0,300}?([0-9]+[.,]?[0-9]*)",
-            html, re.IGNORECASE,
-        )
-        if m:
-            return m.group(1).replace(",", ".")
-        m = re.search(
-            r"PEG\s*Ratio[\s\S]{0,200}?([0-9]+\.[0-9]+)",
-            html, re.IGNORECASE,
-        )
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return "N/A"
-
-
-def fetch_key_stats(ticker: str) -> tuple:
+def _fmp_get_fpe(ticker: str) -> float | None:
     """
-    请求 Key Statistics 页，用 BeautifulSoup 解析 HTML，提取 Forward P/E 与 PEG Ratio。
-    先试 UK 再试 US 域名；若未找到则返回 'N/A'，不抛异常。
+    从 FMP /stable/ratios-ttm 获取 Forward P/E（priceToEarningsRatioTTM）。
+    - 返回 float：成功
+    - 返回 None：失败（Key 未配置 / 限额 / 网络错误）
+    - 副作用：检测到 429 或限额错误时将 _fmp_quota_exceeded 置为 True
     """
-    forward_pe, peg_ratio = "N/A", "N/A"
-    for base_url in _CRAWLER_BASE_URLS:
-        url = base_url.format(ticker=ticker)
-        try:
-            resp = requests.get(url, headers=_CRAWLER_HEADERS, timeout=15)
-            resp.raise_for_status()
-            html = resp.text
-            soup = BeautifulSoup(html, "html.parser")
-
-            fp = _get_value_from_sibling_or_cell(soup, _LABEL_FORWARD_PE)
-            pr = _get_value_from_sibling_or_cell(soup, _LABEL_PEG)
-            if fp != "N/A":
-                forward_pe = fp
-            if pr != "N/A":
-                peg_ratio = pr
-
-            if forward_pe == "N/A":
-                for script in soup.find_all("script"):
-                    src = script.string or ""
-                    if "forwardPE" in src or "priceEpsCurrentYear" in src:
-                        forward_pe = _get_value_from_json(src, ["forwardPE", "priceEpsCurrentYear"])
-                        if forward_pe != "N/A":
-                            break
-                if forward_pe == "N/A":
-                    forward_pe = _get_value_from_json(html, ["forwardPE", "priceEpsCurrentYear"])
-            if peg_ratio == "N/A":
-                for script in soup.find_all("script"):
-                    src = script.string or ""
-                    if "pegRatio" in src:
-                        peg_ratio = _get_value_from_json(src, ["pegRatio"])
-                        if peg_ratio != "N/A":
-                            break
-                if peg_ratio == "N/A":
-                    peg_ratio = _get_value_from_json(html, ["pegRatio"])
-
-            if forward_pe == "N/A":
-                forward_pe = _get_forward_pe_from_html_regex(html)
-            if peg_ratio == "N/A":
-                peg_ratio = _get_peg_from_html_regex(html)
-
-            if forward_pe != "N/A" and peg_ratio != "N/A":
-                break
-        except Exception:
-            continue
-    return forward_pe, peg_ratio
+    global _fmp_quota_exceeded
+    if not FMP_API_KEY or _fmp_quota_exceeded:
+        return None
+    try:
+        resp = _fmp_session.get(
+            f"{_FMP_BASE}/ratios-ttm",
+            params={"symbol": ticker, "apikey": FMP_API_KEY},
+            timeout=10,
+        )
+        # 429 = Too Many Requests / 配额耗尽
+        if resp.status_code == 429:
+            _fmp_quota_exceeded = True
+            return None
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        # FMP 限额时返回 {"Error Message": "..."}
+        if isinstance(data, dict) and "Error Message" in data:
+            err = data["Error Message"].lower()
+            if "limit" in err or "exceed" in err or "quota" in err:
+                _fmp_quota_exceeded = True
+            return None
+        if isinstance(data, list) and data:
+            raw = data[0].get("priceToEarningsRatioTTM")
+            if raw is not None:
+                v = round(float(raw), 2)
+                # 合理性过滤：P/E 在 0~500 外视为脏数据
+                return v if 0 < v < 500 else None
+    except Exception:
+        pass
+    return None
 
 
 # =============================================================================
@@ -722,68 +613,75 @@ def _format_fcf_billions(fcf):
 @st.cache_data(ttl=CACHE_TTL)
 def get_stock_metrics(ticker: str) -> dict:
     """
-    三重保障获取 Forward P/E 与 PEG Ratio。
-    第一优先级：爬虫（BeautifulSoup）→ 'Web Scraper'
-    第二优先级：yfinance API → 'yfinance API'
-    第三优先级（仅 Forward P/E）：currentPrice / forwardEps → 'Calculated'
+    双轨获取 Forward P/E 与 PEG Ratio。
+
+    Forward P/E 优先级：
+      ① FMP /stable/ratios-ttm（准确，不受 Yahoo IP 封锁影响）
+      ② yfinance info.forwardPE（FMP 限额耗尽或不可用时自动降级）
+
+    PEG：
+      yfinance info.pegRatio（直接使用，不经 FMP）
+
+    FMP 限额检测：_fmp_quota_exceeded = True 后整个会话自动跳过 FMP。
     """
-    fpe_str, peg_str = fetch_key_stats(ticker)
-    forward_pe = _parse_metric(fpe_str)
-    peg = _parse_metric(peg_str)
-    source_fpe = "Web Scraper" if forward_pe is not None else None
-    source_peg = "Web Scraper" if peg is not None else None
+    # ── Forward P/E：优先 FMP ─────────────────────────────────────────────
+    forward_pe = _fmp_get_fpe(ticker)
+    source_fpe = "FMP API" if forward_pe is not None else None
 
-    info = None
-    if forward_pe is None or peg is None:
+    # ── yfinance：PEG 必须，Forward P/E 在 FMP 失败时兜底 ────────────────
+    yf_info = None
+    if forward_pe is None or True:   # PEG 始终需要 yfinance
         try:
-            info = yf.Ticker(ticker).info
+            yf_info = yf.Ticker(ticker, session=_yf_session).info or {}
         except Exception:
-            info = {}
+            yf_info = {}
 
-    if forward_pe is None and info:
-        raw = info.get("forwardPE") or info.get("priceEpsCurrentYear")
+    # Forward P/E yfinance 兜底（仅当 FMP 不可用时）
+    if forward_pe is None and yf_info:
+        raw = yf_info.get("forwardPE") or yf_info.get("priceEpsCurrentYear")
         if raw is not None:
             try:
                 forward_pe = round(float(raw), 2)
                 source_fpe = "yfinance API"
             except (TypeError, ValueError):
                 pass
-    if forward_pe is None and info:
-        price = info.get("currentPrice") or info.get("regularMarketPrice")
-        forward_eps = info.get("forwardEps")
-        if price is not None and forward_eps is not None and forward_eps != 0:
-            try:
-                forward_pe = round(price / float(forward_eps), 2)
-                source_fpe = "Calculated"
-            except (TypeError, ValueError):
-                pass
     if source_fpe is None:
         source_fpe = "N/A"
 
-    if peg is None and info:
-        raw = info.get("pegRatio") or info.get("trailingPegRatio")
+    # ── PEG：纯 yfinance ──────────────────────────────────────────────────
+    peg = None
+    source_peg = "N/A"
+    if yf_info:
+        raw = yf_info.get("pegRatio") or yf_info.get("trailingPegRatio")
         if raw is not None:
             try:
-                peg = round(float(raw), 2)
-                source_peg = "yfinance API"
+                v = round(float(raw), 2)
+                if 0.1 <= v <= 100:   # 合理性过滤，排除异常值
+                    peg = v
+                    source_peg = "yfinance API"
             except (TypeError, ValueError):
                 pass
-    if source_peg is None:
-        source_peg = "N/A"
 
     return {
-        "forward_pe": forward_pe,
-        "peg": peg,
+        "forward_pe":       forward_pe,
+        "peg":              peg,
         "source_forward_pe": source_fpe,
-        "source_peg": source_peg,
+        "source_peg":       source_peg,
+        "_yf_info":         yf_info,   # 透传给 get_one_stock_row 复用，避免重复请求
     }
 
 
 def get_one_stock_row(ticker: str) -> dict:
     try:
         metrics = get_stock_metrics(ticker)
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        # 复用 get_stock_metrics 已经拉取的 yf_info，避免对同一 ticker 重复请求
+        info = metrics.get("_yf_info") or {}
+        if not info:
+            try:
+                info = yf.Ticker(ticker, session=_yf_session).info or {}
+            except Exception:
+                info = {}
+
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         prev_close = info.get("previousClose")
         daily_pct = (
@@ -849,6 +747,7 @@ def fetch_history(tickers: list, period: str) -> pd.DataFrame:
         hist = yf.download(
             tickers, period=period, auto_adjust=True,
             progress=False, group_by="ticker", threads=False,
+            session=_yf_session,
         )
         if hist.empty:
             return pd.DataFrame()
@@ -1543,6 +1442,9 @@ def _status_badge(ready: bool, label: str) -> str:
 st.sidebar.markdown(_status_badge(_GROQ_READY,   "Groq API Key"))
 st.sidebar.markdown(_status_badge(_GEMINI_READY, "Gemini API Key"))
 st.sidebar.markdown(_status_badge(_HF_READY,     "HuggingFace Token"))
+st.sidebar.markdown(_status_badge(_FMP_READY,    "FMP API Key"))
+if _FMP_READY and _fmp_quota_exceeded:
+    st.sidebar.warning("⚠️ FMP 日额度已耗尽，Forward P/E 已自动切换为 yfinance。")
 
 if not _GROQ_READY:
     st.sidebar.error("⚠️ GROQ_API_KEY 未配置，AI 分析功能将无法使用。")
@@ -1605,7 +1507,7 @@ else:
 # 主界面
 # =============================================================================
 st.title("📈 美股关键指标")
-st.caption("数据来源：Yahoo Finance。Forward P/E 与 PEG 采用三重保障：爬虫 → yfinance API → 手动计算；表格中「数据来源」列标明每个数值的来源。")
+st.caption("数据来源：Forward P/E 优先使用 FMP API（准确，不受云端 IP 封锁影响），额度耗尽时自动降级为 yfinance。PEG 及其余所有指标均来自 yfinance。")
 
 if not all_tickers:
     st.warning("请在左侧至少选择一只股票或输入自选股代码。")
@@ -1723,4 +1625,4 @@ if not period_df.empty:
     st.caption(f"时间范围：{selected_period_label}（与上方走势图一致）")
     st.dataframe(period_df, width="stretch", hide_index=True)
 
-st.caption("三重保障：① Web Scraper = Key Statistics 页爬虫 ② yfinance API = info.forwardPE / pegRatio ③ Calculated = 最新价 ÷ forwardEps（仅 Forward P/E）。")
+st.caption("数据说明：① FMP API = Forward P/E 首选数据源，不受云端 IP 封锁影响 ② yfinance API = FMP 额度耗尽时自动降级，同时提供 PEG 及其余所有指标。")
