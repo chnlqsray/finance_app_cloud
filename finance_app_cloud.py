@@ -416,8 +416,83 @@ PERIOD_OPTIONS = [
 
 
 # =============================================================================
-# RAG 模块：构建 FAISS 向量库（双保险嵌入引擎）
+# RAG 模块：构建 FAISS 向量库（双保险嵌入引擎）+ 静态索引加载
 # =============================================================================
+# 双轨设计：
+#   ① 静态索引（faiss_index/）→ 预构建的中文投资原则书籍向量库，
+#      部署时随代码一起提交到 GitHub，启动时直接加载（无需重新构建）。
+#      强制使用 HuggingFace Inference API（bge-m3）加载，确保与本地构建时的
+#      嵌入模型完全一致，避免向量维度不匹配。
+#   ② 上传索引（上传财报 PDF）→ 用户上传后实时构建，使用双保险引擎（Gemini 优先）。
+#   ③ 两个索引合并后存入 rag_vectorstore，供 run_crewai_analysis 透明查询。
+# =============================================================================
+
+# 静态索引路径：与 finance_app.py 同级的 faiss_index/ 文件夹
+_KB_INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faiss_index")
+
+
+def load_static_vectorstore():
+    """
+    从磁盘加载静态向量库（faiss_index/index.faiss）。
+    强制使用 HuggingFace Inference API（BAAI/bge-m3），与本地构建时保持一致，
+    避免 Gemini 嵌入维度不匹配导致加载失败。
+    索引不存在或加载失败则返回 None。
+    """
+    index_file = os.path.join(_KB_INDEX_PATH, "index.faiss")
+    if not os.path.exists(index_file):
+        return None, "索引文件不存在"
+    try:
+        from langchain_community.vectorstores import FAISS
+        # 强制 HuggingFace，确保与本地构建时的嵌入模型一致
+        embeddings, embed_src = get_embedding_function(engine_choice="huggingface")
+        if embeddings is None:
+            return None, "HuggingFace Token 未配置，无法加载静态索引"
+        vs = FAISS.load_local(
+            _KB_INDEX_PATH, embeddings,
+            allow_dangerous_deserialization=True,
+        )
+        return vs, embed_src
+    except Exception as e:
+        return None, f"加载失败：{e}"
+
+
+def _rebuild_merged_vs():
+    """
+    合并静态库（中文书籍）与上传库（英文财报），存入 session_state['rag_vectorstore']。
+    任一为 None 则仅使用另一个；两者都有则合并（从磁盘重载静态库避免污染原始对象）。
+    """
+    static_vs   = st.session_state.get("rag_static_vs")
+    uploaded_vs = st.session_state.get("rag_uploaded_vs")
+
+    if static_vs is None and uploaded_vs is None:
+        st.session_state["rag_vectorstore"] = None
+        return
+    if uploaded_vs is None:
+        st.session_state["rag_vectorstore"] = static_vs
+        return
+    if static_vs is None:
+        st.session_state["rag_vectorstore"] = uploaded_vs
+        return
+
+    # 两者都有：重新加载静态库作为合并基础，避免 merge_from 修改原始对象
+    try:
+        from langchain_community.vectorstores import FAISS
+        index_file = os.path.join(_KB_INDEX_PATH, "index.faiss")
+        if os.path.exists(index_file):
+            embeddings, _ = get_embedding_function(engine_choice="huggingface")
+            if embeddings:
+                merged = FAISS.load_local(
+                    _KB_INDEX_PATH, embeddings,
+                    allow_dangerous_deserialization=True,
+                )
+                merged.merge_from(uploaded_vs)
+                st.session_state["rag_vectorstore"] = merged
+                return
+    except Exception:
+        pass
+    # 降级：直接使用上传库（静态库合并失败时不影响财报检索）
+    st.session_state["rag_vectorstore"] = uploaded_vs
+
 
 def build_rag_vectorstore(uploaded_pdf_files=None, engine_choice: str = "auto"):
     """
@@ -520,10 +595,14 @@ def build_rag_vectorstore(uploaded_pdf_files=None, engine_choice: str = "auto"):
 
 
 # =============================================================================
-# RAG 向量库（session_state 持久化）
+# RAG session_state 初始化
 # =============================================================================
-if "rag_vectorstore" not in st.session_state:
-    st.session_state["rag_vectorstore"] = None
+# rag_static_vs   : 静态书籍向量库（从 faiss_index/ 加载）
+# rag_uploaded_vs : 上传财报向量库（用户上传后构建，不持久化）
+# rag_vectorstore : 合并库，供 run_crewai_analysis 使用
+for _ss_key in ("rag_static_vs", "rag_uploaded_vs", "rag_vectorstore"):
+    if _ss_key not in st.session_state:
+        st.session_state[_ss_key] = None
 
 
 class _RAGInput(BaseModel):
@@ -854,15 +933,33 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
                     chunks.append(f"[{src} p{page_label}] {body}")
         return chunks[:max_chunks]
 
-    # ── RAG 搜索：按公司分组，从英文季报中提取财务亮点与风险因子 ────────────
-    # 知识库内容为3家公司的英文季报（约10页/份），无投资哲学类内容。
-    # 查询词使用英文财报关键词，按公司分组检索，确保每家公司都有相关内容。
-    # rag_philosophy 已废弃：中文哲学词汇无法匹配英文季报，改由模型自身知识提供。
-    rag_annual_report_text = ""
-    vs = st.session_state.get("rag_vectorstore")
-    if vs is not None:
+    # ── RAG 双轨搜索 ─────────────────────────────────────────────────────────
+    # ① 静态库（中文投资原则书籍）→ 用中文查询，供第4节首席投资官总结引用哲学背书
+    # ② 上传库（英文季报）→ 用英文查询，供第2节持仓逻辑引用财务数据
+    # 独立检索避免中英文查询词跨语言干扰。
+
+    # ── ① 哲学注入（静态书籍库）────────────────────────────────────────────
+    rag_philosophy_text = ""
+    vs_static = st.session_state.get("rag_static_vs")
+    if vs_static is not None:
         try:
-            ar_chunks = _rag_search(vs, [
+            phil_chunks = _rag_search(vs_static, [
+                "护城河 定价权 竞争优势 长期持有",
+                "芒格 格雷厄姆 投资原则 能力圈",
+                "商业模式 盈利能力 持久竞争优势",
+                "风险 安全边际 价值投资",
+            ], k=2, max_chunks=4)
+            rag_philosophy_text = "\n\n---\n\n".join(phil_chunks) if phil_chunks else ""
+        except Exception:
+            rag_philosophy_text = ""
+
+    # ── ② 季报注入（上传财报库）─────────────────────────────────────────────
+    rag_annual_report_text = ""
+    vs_uploaded = st.session_state.get("rag_uploaded_vs")
+    vs_for_ar = vs_uploaded if vs_uploaded is not None else st.session_state.get("rag_vectorstore")
+    if vs_for_ar is not None:
+        try:
+            ar_chunks = _rag_search(vs_for_ar, [
                 # Meta 相关
                 "Meta revenue advertising AI Reality Labs capital expenditure",
                 # Amazon 相关
@@ -1088,9 +1185,15 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
         agent=news_researcher,
     )
 
-    # ── RAG 注入文本 ───────────────────────────────────────────────────────
-    # 只注入季报财务数据，不再注入哲学类内容（季报中不存在此类内容）。
-    # [:1200] 避免 3 个 chunk × 400 字符被硬截断成残缺引用（如 "[t"）。
+    # ── RAG 注入文本 ─────────────────────────────────────────────────────────
+    # rag_inject_philosophy：中文哲学摘要，供第4节首席投资官总结引用（需注明页码）
+    # rag_inject_annual_report：英文季报财务数据，供第2节持仓逻辑引用
+    rag_inject_philosophy = (
+        "【投资哲学参考（来自本地投资原则书籍，供第4节首席投资官总结引用，需注明来源页码）】\n"
+        + rag_philosophy_text[:1000]
+        + "\n【投资哲学参考结束】\n\n"
+        if rag_philosophy_text else ""
+    )
     _ar_content = rag_annual_report_text.strip()
     rag_inject_annual_report = (
         _ar_content[:1200]
@@ -1261,7 +1364,8 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
 
     task_report = Task(
         description=(
-            "任务：制定 $10,000 / 20年视野的 META、AMZN、GOOG 长线组合。\n"
+            rag_inject_philosophy
+            + "任务：制定 $10,000 / 20年视野的 META、AMZN、GOOG 长线组合。\n"
             "比例和金额已由系统计算完毕，禁止修改数字。\n"
             "只需：① 第1节填投资逻辑标签和信心指数；② 第2节写持仓理由和风险。\n\n"
 
@@ -1296,23 +1400,39 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             "\n### 2. 深度持仓逻辑\n"
             "请严格按以下三节结构输出，每节标题固定，禁止更改：\n\n"
             "#### Meta（META）\n"
-            "持仓理由：（结合ROE排名、Operating Margin护城河、广告平台网络效应）\n"
-            "最大毁灭性风险：（一句话）\n\n"
+            "持仓理由：请从以下四个维度展开，每个维度1-2句，合计不少于5句：\n"
+            "  · 盈利质量：结合ROE排名与Operating Margin护城河说明其定价权来源；\n"
+            "  · 护城河机制：解释广告平台网络效应如何形成不可复制的数据飞轮；\n"
+            "  · 成长驱动：结合季报数据或新闻，说明AI/可穿戴/Reality Labs的增量空间；\n"
+            "  · 20年持有逻辑：阐述为何即使短期估值偏高，长期复利仍有充分保障。\n"
+            "最大毁灭性风险：用2-3句描述：①风险具体场景；②为何足以彻底摧毁持仓逻辑；③当前是否有早期预警信号。\n\n"
             "#### 亚马逊（AMZN）\n"
-            "持仓理由：（结合AWS云业务护城河、物流壁垒、ROE与FCF数据）\n"
-            "最大毁灭性风险：（一句话）\n\n"
+            "持仓理由：请从以下四个维度展开，每个维度1-2句，合计不少于5句：\n"
+            "  · 盈利质量：结合ROE与Operating Margin，分析AWS利润率对整体盈利的支撑；\n"
+            "  · 护城河机制：说明AWS云业务转换成本与物流网络双重壁垒如何相互强化；\n"
+            "  · 成长驱动：结合季报数据或新闻，说明AWS、广告、Prime会员的协同增长空间；\n"
+            "  · 20年持有逻辑：说明亚马逊从零售到基础设施的战略演化为何具备持久竞争力。\n"
+            "最大毁灭性风险：用2-3句描述：①风险具体场景；②为何足以彻底摧毁持仓逻辑；③当前是否有早期预警信号。\n\n"
             "#### 谷歌（GOOG）\n"
-            "持仓理由：（结合ROE第一、FCF第一、搜索+AI双护城河）\n"
-            "最大毁灭性风险：（一句话）\n\n"
+            "持仓理由：请从以下四个维度展开，每个维度1-2句，合计不少于5句：\n"
+            "  · 盈利质量：结合ROE第一与FCF第一，分析谷歌的现金生成能力与资本效率；\n"
+            "  · 护城河机制：解释搜索引擎数据规模效应与AI（Gemini/TPU）双护城河的协同逻辑；\n"
+            "  · 成长驱动：结合季报数据或新闻，说明Google Cloud与AI基础设施的中长期增量；\n"
+            "  · 20年持有逻辑：阐述为何谷歌的数据壁垒与AI先发优势使其长期优势最为稳固。\n"
+            "最大毁灭性风险：用2-3句描述：①风险具体场景；②为何足以彻底摧毁持仓逻辑；③当前是否有早期预警信号。\n\n"
 
             "### 3. 关键财务指标对比\n"
             "**以下表格已由系统精确生成，请原样输出，一个字符都不要修改：**\n"
             + metrics_table_md + "\n\n"
 
             "\n### 4. 首席投资官总结\n"
-            "一句话概括组合策略，并引用一条你熟知的芒格或格雷厄姆经典投资原则。\n"
+            "请写3-4段，每段不少于3句，具体要求：\n"
+            "  · 第1段【组合策略】：说明为何以GOOG为核心重仓、META为第二仓位、AMZN为压舱石；核心逻辑是长期复利能力而非短期估值；结合FCF与ROE双维度数据支撑判断。\n"
+            "  · 第2段【芒格哲学引用】：若任务开头附有投资哲学参考摘要，引用其中至少一条具体观点并注明来源页码；若无摘要，则运用你所熟知的芒格/格雷厄姆经典原则（护城河/能力圈/安全边际），说明该原则如何直接指导本组合构建逻辑。\n"
+            "  · 第3段【风险对冲观】：说明三家公司的主要风险（监管/AI竞争/宏观）在组合层面如何相互分散，以及何种宏观情景会使整个组合同时承压。\n"
+            "  · 第4段【20年信心声明】：以首席投资官口吻，用肯定语气陈述20年后这三家公司护城河仍然稳固的核心理由，并说明在什么条件下会考虑增持或减持。\n"
         ),
-        expected_output="按报告格式完整输出上述四节内容，数字禁止修改，公司名称使用规定格式。",
+        expected_output="按报告格式完整输出四节内容：第2节每家公司持仓理由不少于5句分四维度；第4节首席投资官总结写3-4段，含芒格哲学引用（有知识库则注明页码，无则引用经典原则）。数字禁止修改，公司名称使用规定格式。",
         agent=chief_strategist,
         context=[task_analysis, task_news],
     )
@@ -1438,12 +1558,29 @@ if not _GEMINI_READY and not _HF_READY:
     st.sidebar.warning("⚠️ 嵌入引擎密钥均未配置，RAG 知识库功能将不可用。")
 
 # -----------------------------------------------------------------------------
-# 侧边栏：RAG 知识库管理
+# 侧边栏：RAG 知识库管理（双轨：静态书籍索引 + 上传财报）
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.header("📚 知识库管理 (RAG)")
 
-# ── 嵌入引擎选择器 ─────────────────────────────────────────────────────────
+# ── 静态索引状态显示 ───────────────────────────────────────────────────────
+_index_exists = os.path.exists(os.path.join(_KB_INDEX_PATH, "index.faiss"))
+if _index_exists:
+    st.sidebar.caption("📚 投资原则索引：已就绪（随代码部署，启动时自动加载）")
+else:
+    st.sidebar.caption("📚 投资原则索引：未找到（请确认 faiss_index/ 已提交到仓库）")
+
+# ── 启动时自动加载静态索引 ─────────────────────────────────────────────────
+if st.session_state["rag_static_vs"] is None and _index_exists:
+    with st.spinner("正在加载投资原则知识库…"):
+        _vs_static, _static_msg = load_static_vectorstore()
+        st.session_state["rag_static_vs"] = _vs_static
+        if _vs_static:
+            _rebuild_merged_vs()
+        else:
+            st.sidebar.warning(f"⚠️ 投资原则索引加载失败：{_static_msg}")
+
+# ── 嵌入引擎选择器（仅影响上传财报的构建）────────────────────────────────
 _engine_options = {
     "🤖 自动（优先 Gemini，失败切换 HF）": "auto",
     "🔵 Google Gemini（免费层，有日限额）": "gemini",
@@ -1454,6 +1591,7 @@ _engine_label = st.sidebar.selectbox(
     options=list(_engine_options.keys()),
     index=0,
     help=(
+        "仅影响上传财报的构建引擎。投资原则索引始终使用 HuggingFace（与本地构建保持一致）。\n"
         "Gemini：免费层每天约 1500 次请求，财报PDF较短时推荐。 "
         "HuggingFace：无日限额，但 Inference API 响应较慢。 "
         "Gemini 日限额用完后请手动切换为 HuggingFace。"
@@ -1461,31 +1599,41 @@ _engine_label = st.sidebar.selectbox(
 )
 _selected_engine = _engine_options[_engine_label]
 
-st.sidebar.caption("📌 建议上传精简财报（每份 ≤30页，总计 ≤3份），避免 chunk 过多超限额。")
-
+# ── 上传财报（临时，不持久化）────────────────────────────────────────────
+st.sidebar.markdown("**上传财报 PDF**（临时，刷新后需重新上传）")
+st.sidebar.caption("📌 建议每份 ≤30页，总计 ≤3份，避免 chunk 过多超限额。")
 uploaded_pdfs = st.sidebar.file_uploader(
     "上传财报或研报 PDF",
     type=["pdf"],
     accept_multiple_files=True,
-    help="仅支持上传文件，静态 knowledge_base 文件夹已停用（防止大型研报产生过多 chunk 超限额）",
+    label_visibility="collapsed",
+    help="上传财报将与投资原则索引合并，共同供首席投资官参考。",
 )
 
-if st.sidebar.button("🔨 构建 / 更新知识库", use_container_width=True):
+if st.sidebar.button("🔨 构建 / 更新财报知识库", use_container_width=True):
     if not uploaded_pdfs:
-        st.sidebar.warning("⚠️ 请先上传至少一个 PDF 文件。")
+        st.sidebar.warning("⚠️ 请先上传至少一个财报 PDF 文件。")
     else:
         with st.sidebar:
-            with st.spinner("正在构建向量知识库，请稍候..."):
-                vs = build_rag_vectorstore(
+            with st.spinner("正在构建财报向量知识库，请稍候..."):
+                vs_up = build_rag_vectorstore(
                     uploaded_pdf_files=uploaded_pdfs,
                     engine_choice=_selected_engine,
                 )
-                st.session_state["rag_vectorstore"] = vs
-                if vs is None:
-                    st.warning("⚠️ 知识库构建失败，请检查 PDF 文件和嵌入引擎配置。")
+                st.session_state["rag_uploaded_vs"] = vs_up
+                if vs_up is None:
+                    st.warning("⚠️ 财报知识库构建失败，请检查 PDF 文件和嵌入引擎配置。")
+                else:
+                    _rebuild_merged_vs()
 
+# ── 知识库状态显示 ────────────────────────────────────────────────────────
 if st.session_state["rag_vectorstore"] is not None:
-    st.sidebar.success("📖 知识库就绪")
+    _parts = []
+    if st.session_state.get("rag_static_vs"):
+        _parts.append("📚 投资原则")
+    if st.session_state.get("rag_uploaded_vs"):
+        _parts.append("📄 上传财报")
+    st.sidebar.success(f"📖 知识库就绪（{'  +  '.join(_parts)}）")
 else:
     st.sidebar.info("📭 知识库为空（首席投资官将跳过 RAG 检索）")
 
