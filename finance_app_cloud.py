@@ -275,6 +275,8 @@ def get_embedding_function(engine_choice: str = "auto"):
     # ── HuggingFace Inference API ──────────────────────────────────────────
     # 使用 BAAI/bge-m3：支持中英文跨语言检索（8192 token 上限），
     # 优于 all-MiniLM-L6-v2（仅 256 token 且不支持中文查询）。
+    # 冷启动重试：HuggingFace 免费层模型休眠后首次请求易触发 504 Gateway Timeout，
+    # 自动等待 35 秒后重试一次，重试期间向用户展示友好提示而非原始报错。
     if use_hf and HF_TOKEN:
         try:
             from langchain_huggingface import HuggingFaceEndpointEmbeddings
@@ -284,10 +286,39 @@ def get_embedding_function(engine_choice: str = "auto"):
                 # timeout 参数已移除：HuggingFaceEndpointEmbeddings 当前版本
                 # Pydantic schema 不接受此参数（extra_forbidden），传入会直接报错
             )
-            embeddings.embed_query("test")
-            return embeddings, "HuggingFace Inference API (BAAI/bge-m3)"
+            # 用测试请求触发冷启动，若 504 则等待后自动重试一次
+            _hf_warmup_ok = False
+            _hf_last_err = None
+            for _hf_attempt in range(2):
+                try:
+                    embeddings.embed_query("test")
+                    _hf_warmup_ok = True
+                    break
+                except Exception as _e:
+                    _hf_last_err = _e
+                    _is_timeout = any(k in str(_e).upper() for k in ("504", "GATEWAY", "TIMEOUT", "TIMED OUT"))
+                    if _hf_attempt == 0 and _is_timeout:
+                        st.sidebar.info(
+                            "⏳ HuggingFace 模型正在从休眠中唤醒，"
+                            "约需 35 秒，请稍候…"
+                        )
+                        import time
+                        time.sleep(35)
+                    else:
+                        break  # 非超时错误或第二次仍失败，不再重试
+            if _hf_warmup_ok:
+                return embeddings, "HuggingFace Inference API (BAAI/bge-m3)"
+            else:
+                raise _hf_last_err
         except Exception as e:
-            st.sidebar.warning(f"⚠️ HuggingFace 嵌入引擎失败：{e}")
+            _is_timeout = any(k in str(e).upper() for k in ("504", "GATEWAY", "TIMEOUT", "TIMED OUT"))
+            if _is_timeout:
+                st.sidebar.warning(
+                    "⚠️ HuggingFace 模型唤醒超时（两次尝试均未响应）。"
+                    "这是免费层冷启动的已知问题，通常再等 1-2 分钟后重试即可恢复。"
+                )
+            else:
+                st.sidebar.warning(f"⚠️ HuggingFace 嵌入引擎失败：{e}")
 
     return None, "不可用"
 
