@@ -2,6 +2,8 @@
 Streamlit 应用保活脚本
 使用 Playwright 启动真实 Chromium 浏览器，建立 WebSocket 连接，
 触发 Streamlit 活跃检测，防止应用进入休眠（12小时无活动触发）。
+
+更新：自动处理 Streamlit 休眠拦截页（点击"Yes, get this app back up!"按钮）。
 """
 
 import time
@@ -12,23 +14,38 @@ URLS = [
     "https://my-movie-ai.streamlit.app/",
 ]
 
-# Streamlit 主容器的 selector，页面完全加载后出现
+# Streamlit 主容器 selector（页面正常加载后出现）
 STREAMLIT_READY_SELECTOR = 'div[data-testid="stAppViewContainer"]'
 
-# 冷启动最长等待时间（毫秒）：90秒，足够覆盖休眠后的重建过程
-COLD_START_TIMEOUT_MS = 90_000
+# 休眠拦截页的唤醒按钮 selector（同时覆盖 owner 和普通访客两种按钮）
+WAKEUP_BUTTON_SELECTOR = 'button[data-testid="wakeup-button-owner"], button[data-testid="wakeup-button"]'
+
+# 冷启动最长等待时间（毫秒）：120秒，覆盖点击唤醒后的重建过程
+COLD_START_TIMEOUT_MS = 120_000
 
 # 页面加载成功后额外停留时间（秒）：确保 WebSocket 心跳稳定发送
 HEARTBEAT_STAY_SECONDS = 20
 
 
 def wake_app(page, url: str, index: int) -> bool:
-    """访问单个 Streamlit 应用，等待加载完成并停留以维持 WebSocket 连接。"""
+    """访问单个 Streamlit 应用，处理休眠拦截页，等待加载完成并停留维持 WebSocket 连接。"""
     print(f"\n[{index}] 正在访问：{url}")
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        print(f"[{index}] 页面已加载，等待 Streamlit 容器就绪（最长 90 秒）…")
 
+        # ── 检测是否出现休眠拦截页，若有则点击唤醒按钮 ──────────────────
+        try:
+            wakeup_btn = page.wait_for_selector(WAKEUP_BUTTON_SELECTOR, timeout=5_000)
+            if wakeup_btn:
+                print(f"[{index}] 检测到休眠拦截页，正在点击唤醒按钮…")
+                wakeup_btn.click()
+                print(f"[{index}] 唤醒按钮已点击，等待应用重新启动（最长 120 秒）…")
+        except PlaywrightTimeoutError:
+            # 5秒内未出现唤醒按钮，说明应用未休眠，正常加载中
+            print(f"[{index}] 未检测到休眠页，应用正常加载中…")
+
+        # ── 等待 Streamlit 主容器出现（无论是否经过唤醒）────────────────
+        print(f"[{index}] 等待 Streamlit 容器就绪…")
         page.wait_for_selector(STREAMLIT_READY_SELECTOR, timeout=COLD_START_TIMEOUT_MS)
         print(f"[{index}] ✅ Streamlit 容器已就绪，WebSocket 连接已建立。")
 
@@ -41,7 +58,7 @@ def wake_app(page, url: str, index: int) -> bool:
         return True
 
     except PlaywrightTimeoutError:
-        print(f"[{index}] ⚠️ 超时：应用在 90 秒内未完成加载（可能仍在冷启动中）。")
+        print(f"[{index}] ⚠️ 超时：应用在 120 秒内未完成加载。")
         try:
             page.screenshot(path=f"screenshot_{index}_timeout.png")
         except Exception:
@@ -50,6 +67,10 @@ def wake_app(page, url: str, index: int) -> bool:
 
     except Exception as e:
         print(f"[{index}] ❌ 发生错误：{e}")
+        try:
+            page.screenshot(path=f"screenshot_{index}_error.png")
+        except Exception:
+            pass
         return False
 
 
@@ -61,7 +82,6 @@ def main():
         browser = p.chromium.launch(headless=True)
 
         for i, url in enumerate(URLS, start=1):
-            # 每个 URL 使用独立的页面上下文，互不干扰
             context = browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -85,8 +105,7 @@ def main():
             all_ok = False
 
     if not all_ok:
-        print("\n部分应用未能在超时时间内完成加载，可能正处于冷启动中。")
-        print("下次触发时应已恢复正常。")
+        print("\n部分应用未能在超时时间内完成加载，下次触发时应已恢复正常。")
 
     print("\n=== 脚本结束 ===")
 
