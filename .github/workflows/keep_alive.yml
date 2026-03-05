@@ -1,0 +1,56 @@
+name: Streamlit Keep Alive
+
+on:
+  schedule:
+    # 每 6 小时运行一次，UTC 时间 0/6/12/18 点整
+    # 确保在任意 12 小时休眠窗口内至少触发两次
+    - cron: '0 0,6,12,18 * * *'
+  workflow_dispatch:  # 允许在 GitHub 网页上手动触发，方便测试
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # 整个 job 超时保护，防止异常挂起消耗额度
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装 Playwright Python 包
+        run: pip install playwright
+
+      # ── Chromium 缓存：避免每次重新下载 200MB ──────────────────────────
+      # 缓存 key 基于 Playwright 版本号，版本升级时自动失效并重新下载
+      - name: 获取 Playwright 版本号（用于缓存 key）
+        id: playwright-version
+        run: echo "version=$(pip show playwright | grep Version | cut -d ' ' -f2)" >> $GITHUB_OUTPUT
+
+      - name: 从缓存恢复 Chromium
+        id: cache-chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: chromium-${{ steps.playwright-version.outputs.version }}
+
+      - name: 安装 Chromium（仅缓存未命中时执行）
+        if: steps.cache-chromium.outputs.cache-hit != 'true'
+        run: playwright install chromium
+
+      # ── 运行保活脚本 ────────────────────────────────────────────────────
+      - name: 运行保活脚本
+        run: python keep_alive.py
+
+      # ── 上传截图（可选，方便在 Actions 日志里验证访问结果）──────────────
+      - name: 上传截图
+        if: always()  # 即使脚本超时也尝试上传
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: screenshot_*.png
+          retention-days: 7  # 截图保留 7 天后自动删除，节省存储空间
+          if-no-files-found: ignore
