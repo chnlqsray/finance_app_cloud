@@ -25,7 +25,6 @@ jobs:
         run: pip install playwright
 
       # ── Chromium 缓存：避免每次重新下载 200MB ──────────────────────────
-      # 缓存 key 基于 Playwright 版本号，版本升级时自动失效并重新下载
       - name: 获取 Playwright 版本号（用于缓存 key）
         id: playwright-version
         run: echo "version=$(pip show playwright | grep Version | cut -d ' ' -f2)" >> $GITHUB_OUTPUT
@@ -41,9 +40,9 @@ jobs:
         if: steps.cache-chromium.outputs.cache-hit != 'true'
         run: playwright install chromium
 
-      # ── 运行保活脚本 ────────────────────────────────────────────────────
+      # ── 运行保活脚本（-u 参数：禁用输出缓冲，日志实时显示）───────────
       - name: 运行保活脚本
-        run: python keep_alive.py
+        run: python -u keep_alive.py
 
       # ── 上传截图（可选，方便在 Actions 日志里验证访问结果）──────────────
       - name: 上传截图
@@ -52,5 +51,5 @@ jobs:
         with:
           name: screenshots-${{ github.run_number }}
           path: screenshot_*.png
-          retention-days: 7  # 截图保留 7 天后自动删除，节省存储空间
+          retention-days: 7
           if-no-files-found: ignore
