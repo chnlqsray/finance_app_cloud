@@ -23,7 +23,7 @@ WAKEUP_BUTTON_SELECTOR = 'button[data-testid="wakeup-button-owner"], button[data
 WAKEUP_BUTTON_WAIT_MS = 20_000
 
 # 冷启动最长等待时间：90 秒（实测唤醒在 60 秒内完成，留有余量）
-COLD_START_TIMEOUT_MS = 90_000
+COLD_START_TIMEOUT_MS = 120_000
 
 # 页面加载成功后额外停留时间（秒）：确保 WebSocket 心跳稳定发送
 HEARTBEAT_STAY_SECONDS = 20
@@ -33,11 +33,15 @@ def wake_app(page, url: str, index: int) -> bool:
     """访问单个 Streamlit 应用，处理休眠拦截页，等待加载完成并停留维持 WebSocket 连接。"""
     print(f"\n[{index}] 正在访问：{url}", flush=True)
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        # ── 核心修复：改用 networkidle，等待 React 真正渲染完毕 ──────────
+        # 原因：domcontentloaded 只代表 HTML 骨架加载完，此时页面仍是空白
+        # networkidle 代表网络请求静止，React 已完成渲染，按钮/容器才真正出现
+        print(f"[{index}] 等待页面完整渲染（networkidle）…", flush=True)
+        page.goto(url, wait_until="networkidle", timeout=60_000)
 
-        # ── 阶段截图①：页面 DOM 加载后立即截图，确认看到什么 ──────────
+        # ── 阶段截图①：页面渲染完成后立即截图 ───────────────────────────
         page.screenshot(path=f"screenshot_{index}_1_after_load.png")
-        print(f"[{index}] 截图①已保存（DOM加载后）", flush=True)
+        print(f"[{index}] 截图①已保存（页面渲染后）", flush=True)
 
         # ── 检测是否出现休眠拦截页（等待 20 秒让 React 完成渲染）────────
         try:
