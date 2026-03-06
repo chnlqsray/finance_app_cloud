@@ -37,6 +37,9 @@ def wake_app(page, url: str, index: int) -> bool:
         print(f"[{index}] 等待页面完整渲染（networkidle）…", flush=True)
         page.goto(url, wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
         print(f"[{index}] ✅ 页面渲染完成（networkidle 触发）", flush=True)
+        # React 在本地完成渲染需要额外时间，不产生网络请求
+        # 必须等待 3 秒让 React 把按钮画出来，否则 btn.count() 会返回 0
+        page.wait_for_timeout(3000)
 
         # ── 阶段截图①：渲染完成后立即截图，确认页面状态 ─────────────────
         page.screenshot(path=f"screenshot_{index}_1_after_load.png")
