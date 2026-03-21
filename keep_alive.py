@@ -118,8 +118,8 @@ def wake_huggingface(page, url: str, index: int) -> bool:
     """
     print(f"\n[HF-{index}] 正在访问：{url}", flush=True)
     try:
-        print(f"[HF-{index}] 等待页面完整渲染（networkidle）…", flush=True)
-        page.goto(url, wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
+        print(f"[HF-{index}] 等待页面基础加载（load）…", flush=True)
+        page.goto(url, wait_until="load", timeout=PAGE_LOAD_TIMEOUT_MS)
         page.wait_for_timeout(3000)
 
         page.screenshot(path=f"screenshot_hf{index}_1_after_load.png")
