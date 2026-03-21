@@ -11,6 +11,8 @@ jobs:
   keep-alive:
     runs-on: ubuntu-latest
     timeout-minutes: 10  # 整个 job 超时保护，防止异常挂起消耗额度
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # 提前切换至 Node.js 24，消除弃用警告
 
     steps:
       - name: 检出代码
