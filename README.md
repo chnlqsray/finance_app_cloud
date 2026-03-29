@@ -88,4 +88,4 @@ Extensive debugging confirmed that ChatOpenAI is a pure LangChain object invoked
 
 ---
 
-*Independently designed and delivered · 2025–2026*
+*Independently designed and delivered · 2026*
