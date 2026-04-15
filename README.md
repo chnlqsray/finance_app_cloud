@@ -6,7 +6,7 @@ An automated US equity research platform that fetches real-time financial metric
 
 🌐 **[Streamlit Cloud](https://my-finance-ai.streamlit.app/)** · **[HuggingFace Spaces](https://huggingface.co/spaces/chnlqsray/finance-dashboard)**
 
-▶ **[YouTube 演示视频](https://youtu.be/oHZ3-8EK-4U)** · **[Bilibili 演示视频](https://www.bilibili.com/video/BV1WScyzDEtX/)**
+▶ **[YouTube 演示视频](https://youtu.be/5YCtdb15YWs)** · **[Bilibili 演示视频](https://www.bilibili.com/video/BV1WScyzDEtX/)**
 
 ---
 
