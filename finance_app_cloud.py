@@ -33,7 +33,7 @@ import os
 os.environ["OTEL_SDK_DISABLED"] = "true"
 os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
 # =============================================================================
-# 【LLM 兼容层 v9c — crewai.LLM + 显式 litellm（根治依赖冲突和 LiteLLM 缺失双重问题）】
+# 【LLM 兼容层 v10 — cache_breakpoint 注入 Bug 根治（CrewAI 1.14.x 官方已知问题）】
 #
 # 完整错误历史：
 #   v1-v3: dummy OPENAI_API_KEY → LiteLLM 拿假 key 真发 OpenAI 请求 → 401
@@ -46,6 +46,11 @@ os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
 #          crewai 1.14.6 中 litellm 变为可选依赖，未显式安装 → Fallback not available
 #   v9b:   ChatOpenAI + crewai<0.63.0 版本锁定 → 依赖解析失败（embedchain-crewai 冲突），
 #          Streamlit Cloud 连网页都无法生成
+#   v9c:   crewai.LLM + 显式安装 litellm → 稳定路由 Groq，但遇到新 Bug ↓
+#   v10:   【本版本】CrewAI 1.14.x Bug（Issue #5886）：
+#          mark_cache_breakpoint() 对所有 Provider 无差别注入 cache_breakpoint: true，
+#          Groq API 拒绝接受 → GroqException: 'cache_breakpoint' is unsupported。
+#          修复：monkey-patch mark_cache_breakpoint 为恒等函数（见 crewai import 后）。
 #
 # v9c 根治方案（部署日志确认）：
 #   日志证实 crewai 1.14.6 安装包列表中无 litellm（它在 1.x 中变为可选依赖）。
@@ -58,6 +63,8 @@ os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
 os.environ.setdefault("OPENAI_API_KEY",  "placeholder-will-be-replaced-by-groq-key")
 os.environ.setdefault("OPENAI_API_BASE", "https://api.groq.com/openai/v1")
 os.environ.setdefault("OPENAI_BASE_URL", "https://api.groq.com/openai/v1")  # openai SDK >= 1.x 读此变量
+# 【防御性配置】令 litellm 静默丢弃各 Provider 不支持的额外参数（多一层保险）
+os.environ["LITELLM_DROP_PARAMS"] = "True"
 
 import io
 import re
@@ -75,6 +82,30 @@ import altair as alt
 
 from crewai import Agent, Task, Crew, Process, LLM  # v9c: crewai 1.14.6 必须用 crewai.LLM，配合显式安装的 litellm 路由 Groq
 from crewai.tools import BaseTool
+
+# =============================================================================
+# 【v10 根治补丁：CrewAI 1.14.x cache_breakpoint 注入 Bug】
+# =============================================================================
+# 根本原因（与 Streamlit Cloud IP / yfinance 无关）：
+#   CrewAI 1.14.x 在 agent_executor.py 中对所有 Provider 无差别调用
+#   mark_cache_breakpoint()，向 system message 注入 "cache_breakpoint: true"。
+#   Anthropic 适配器会自行处理并剥离该字段，但 Groq / OpenAI-compatible
+#   等其他 Provider 直接将其透传给 API，Groq 拒绝接受并报错：
+#     GroqException - 'messages.0': property 'cache_breakpoint' is unsupported
+#
+#   官方 Bug 追踪：https://github.com/crewAIInc/crewAI/issues/5886
+#   （Issue 状态：Open，尚未合入正式版本，故需在应用层打补丁）
+#
+# 修复方案：
+#   将 crewai.llms.cache.mark_cache_breakpoint 替换为恒等函数（lambda msg: msg），
+#   使其成为无操作的透明函数。cache_breakpoint 字段永远不会被注入任何消息体，
+#   Groq 及所有其他 Provider 均可正常接收消息。
+# =============================================================================
+try:
+    import crewai.llms.cache as _crewai_cache_patch
+    _crewai_cache_patch.mark_cache_breakpoint = lambda msg: msg
+except Exception:
+    pass  # 若 crewai 未来版本移除该模块，补丁自动失效，不影响启动
 from langchain_community.tools import DuckDuckGoSearchRun
 from pydantic import BaseModel, Field
 from typing import Type
