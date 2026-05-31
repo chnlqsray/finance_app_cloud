@@ -33,7 +33,7 @@ import os
 os.environ["OTEL_SDK_DISABLED"] = "true"
 os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
 # =============================================================================
-# 【LLM 兼容层 v9b — ChatOpenAI + crewai 版本锁定（根治 pydantic 和 LiteLLM 双重问题）】
+# 【LLM 兼容层 v9c — crewai.LLM + 显式 litellm（根治依赖冲突和 LiteLLM 缺失双重问题）】
 #
 # 完整错误历史：
 #   v1-v3: dummy OPENAI_API_KEY → LiteLLM 拿假 key 真发 OpenAI 请求 → 401
@@ -42,14 +42,15 @@ os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
 #   v6:    ChatGroq + pop(OPENAI_API_KEY) → LiteLLM import 存在性检查 → OPENAI_API_KEY is required
 #   v7:    CrewLLM("openai/...") → 仍走 LiteLLM 路由 → Fallback not available
 #   v8:    ChatOpenAI(base_url=Groq) → 稳定运行
-#   v9:    crewai.LLM("groq/...") → 适配 crewai 0.63+ pydantic 验证，但 Streamlit Cloud
-#          上的旧版 LiteLLM 仍报 "Fallback to LiteLLM is not available"
+#   v9:    crewai.LLM("groq/...") → crewai 升至 1.14.6 后拒绝 ChatOpenAI（pydantic）；
+#          crewai 1.14.6 中 litellm 变为可选依赖，未显式安装 → Fallback not available
+#   v9b:   ChatOpenAI + crewai<0.63.0 版本锁定 → 依赖解析失败（embedchain-crewai 冲突），
+#          Streamlit Cloud 连网页都无法生成
 #
-# v9b 根治方案：
-#   crewai 的破坏性变更（拒绝 ChatOpenAI）发生在 0.63.0。
-#   requirements.txt 锁定 crewai<0.63.0，强制 Streamlit Cloud 安装接受 ChatOpenAI 的版本。
-#   代码恢复 v8 的 ChatOpenAI 方案：绕过 LiteLLM 路由，彻底消除 v5/v7/v9 的 LiteLLM 问题。
-#   后续如需升级 crewai，需重新评估 LLM 兼容方案再放开版本约束。
+# v9c 根治方案（部署日志确认）：
+#   日志证实 crewai 1.14.6 安装包列表中无 litellm（它在 1.x 中变为可选依赖）。
+#   requirements.txt 移除 <0.63.0 锁定（会导致依赖冲突），改为显式添加 litellm>=1.40.0。
+#   代码恢复 crewai.LLM 方案（crewai 1.14.6 必须用此方式），litellm 显式安装后可正常路由 Groq。
 # =============================================================================
 # 【模块级占位】LiteLLM import 阶段会检查 OPENAI_API_KEY 是否存在（不检查有效性）。
 # 若不存在则抛 "OPENAI_API_KEY is required"，连运行都到不了。
@@ -72,8 +73,7 @@ import pandas as pd
 import yfinance as yf
 import altair as alt
 
-from crewai import Agent, Task, Crew, Process
-from langchain_openai import ChatOpenAI  # v9b: crewai<0.63.0 接受 LangChain ChatOpenAI，绕过 LiteLLM 路由
+from crewai import Agent, Task, Crew, Process, LLM  # v9c: crewai 1.14.6 必须用 crewai.LLM，配合显式安装的 litellm 路由 Groq
 from crewai.tools import BaseTool
 from langchain_community.tools import DuckDuckGoSearchRun
 from pydantic import BaseModel, Field
@@ -138,33 +138,38 @@ _FMP_READY    = bool(FMP_API_KEY)
 
 
 # =============================================================================
-# 【云端 LLM 配置】ChatOpenAI + Groq 兼容接口（v9b，锁定 crewai<0.63.0）
+# 【云端 LLM 配置】crewai.LLM + Groq（v9c，显式安装 litellm）
 # =============================================================================
 # 架构变化说明：
 # - 原来：logic_llm = deepseek-r1:7b（Ollama）/ tool_llm = llama3.2（Ollama）
 # - 现在：所有 Agent 统一使用 llama-3.3-70b-versatile（Groq API）
 #   理由：70B 模型指令遵循能力远优于本地 3B/7B，无需分开用两个模型
 
-def _make_groq_llm():
+def _make_groq_llm(max_tokens: int = 4000, num_retries: int = 6):
     """
-    【v9b】ChatOpenAI 指向 Groq 兼容接口，配合 requirements.txt 锁定 crewai<0.63.0。
+    【v9c + 限速重试】crewai.LLM + 显式安装 litellm，适配 crewai 1.14.6。
 
-    crewai<0.63.0 的 Agent.llm 接受任意 LangChain LLM 对象，直接调用 .invoke()，
-    完全不经过 LiteLLM 路由，从根本上消除 v5/v7/v9 的 "Fallback not available" 问题。
-    OPENAI_API_BASE 重定向确保任何内部组件走 env var 发请求也只打到 Groq，不会误用 OpenAI。
+    crewai 1.14.6 的 Agent.llm 只接受 str 或 crewai.LLM 实例（pydantic 强校验）。
+    crewai.LLM 通过 litellm 路由，"groq/" 前缀告知 litellm 使用 Groq provider。
+    litellm 在 crewai 1.x 中已变为可选依赖，需在 requirements.txt 显式声明才会安装。
+    OPENAI_API_KEY 占位符保留以通过 litellm import 阶段的存在性检查。
+
+    max_tokens   : 不同 Agent 可传入不同值（中间层 2000，最终报告 4000），
+                   减少 TPM 消耗，为后续 Agent 保留余量。
+    num_retries  : litellm 内建重试次数，遇到 429 时尊重 Retry-After 响应头自动等待。
+    request_timeout: 防止长时间挂起。
     """
     if not GROQ_API_KEY:
         return None
-    os.environ["OPENAI_API_KEY"]  = GROQ_API_KEY
-    os.environ["OPENAI_API_BASE"] = "https://api.groq.com/openai/v1"
-    os.environ["OPENAI_BASE_URL"] = "https://api.groq.com/openai/v1"
-    os.environ["GROQ_API_KEY"]    = GROQ_API_KEY
-    return ChatOpenAI(
-        model="llama-3.3-70b-versatile",
-        base_url="https://api.groq.com/openai/v1",
+    os.environ["OPENAI_API_KEY"] = GROQ_API_KEY   # litellm import 存在性检查
+    os.environ["GROQ_API_KEY"]   = GROQ_API_KEY   # litellm Groq provider 读取此变量
+    return LLM(
+        model="groq/llama-3.3-70b-versatile",
         api_key=GROQ_API_KEY,
         temperature=0.1,
-        max_retries=2,
+        max_tokens=max_tokens,
+        num_retries=num_retries,
+        request_timeout=120,
     )
 
 
@@ -903,7 +908,11 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
     """
 
     # ── 检查 Groq API 密钥 ─────────────────────────────────────────────────
-    llm = _make_groq_llm()
+    # llm       ：首席投资官（最终报告），需要 4000 token 的完整输出
+    # llm_brief ：中间 Agent（数据分析师、情报研究员），输出 2000 token 足够，
+    #             节省 TPM 余量，避免后续 Agent 触发限速
+    llm = _make_groq_llm(max_tokens=3000)
+    llm_brief = _make_groq_llm(max_tokens=2000)
     if llm is None:
         return (
             "❌ **Groq API 密钥未配置**\n\n"
@@ -1092,8 +1101,8 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
         try:
             _raw = _ddg_runner.run(_q)
             _snippet = str(_raw or "(no result)")
-            if len(_snippet) > 600:
-                _snippet = _snippet[:600] + "...[截断]"
+            if len(_snippet) > 250:
+                _snippet = _snippet[:250] + "...[截断]"
         except Exception as _e:
             _snippet = f"(搜索失败: {_e})"
         _pre_search_results.append(f"【{_co}】查询词: {_q}\n结果: {_snippet}")
@@ -1109,7 +1118,7 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             "重要：D/E 数值已是百分比（39.16 = 39.16%），高杠杆风险由系统预计算给出，直接引用结论，不得自行判断。"
         ),
         backstory="你只相信数字，逻辑严密，从不主观臆测。你严格遵循系统给出的预计算风险结论，不会自行推翻。",
-        llm=llm,
+        llm=llm_brief,
         verbose=True,
         allow_delegation=False,
     )
@@ -1125,7 +1134,7 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             "用流畅的中文呈现护城河分析、风险要点和最新动态。"
         ),
         tools=[],
-        llm=llm,
+        llm=llm_brief,
         verbose=True,
         allow_delegation=False,
         max_iter=4,
@@ -1384,91 +1393,109 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
             "| **总计** | -- | **100%** | **$10,000** | -- |\n"
         )
 
-    task_report = Task(
-        description=(
-            rag_inject_philosophy
-            + "任务：制定 $10,000 / 20年视野的 META、AMZN、GOOG 长线组合。\n"
-            "比例和金额已由系统计算完毕，禁止修改数字。\n"
-            "只需：① 第1节填投资逻辑标签和信心指数；② 第2节写持仓理由和风险。\n\n"
+    # ── task_report 描述：预先构建为变量，在 Phase 2 启动时注入 Phase 1 摘要 ──
+    # 不在此处创建 Task 对象，避免 context= 机制将 task1/task2 完整输出拼入 prompt。
+    _task_report_desc = (
+        rag_inject_philosophy
+        + "任务：制定 $10,000 / 20年视野的 META、AMZN、GOOG 长线组合。\n"
+        "比例和金额已由系统计算完毕，禁止修改数字。\n"
+        "只需：① 第1节填投资逻辑标签和信心指数；② 第2节写持仓理由和风险。\n\n"
 
-            "**【强制约束1：公司名称】**\n"
-            "全文中公司名称只允许使用以下格式，禁止任何其他翻译、别名或音译：\n"
-            "- META → 只写「Meta（META）」\n"
-            "- AMZN → 只写「亚马逊（AMZN）」\n"
-            "- GOOG → 只写「谷歌（GOOG）」\n\n"
+        "**【强制约束1：公司名称】**\n"
+        "全文中公司名称只允许使用以下格式，禁止任何其他翻译、别名或音译：\n"
+        "- META → 只写「Meta（META）」\n"
+        "- AMZN → 只写「亚马逊（AMZN）」\n"
+        "- GOOG → 只写「谷歌（GOOG）」\n\n"
 
-            "**【强制约束2：20年信心指数含义】**\n"
-            "信心指数 = 你对该公司20年后护城河仍然稳固的主观确信度（0=不确信，100=极度确信）。\n"
-            "它与分配比例是两个独立维度：\n"
-            "  · 分配比例由Python基于ROE/FCF/利润率等6项财务指标量化计算，反映当前财务相对优势。\n"
-            "  · 信心指数是你对护城河深度与商业模式可持续性的定性判断，可独立于比例高低。\n"
-            "例如：META信心85、谷歌信心95，两者都是高确信，但谷歌的FCF和ROE双项第一，\n"
-            "导致量化分配比例差距较大——这是正常且合理的，请如实填写，不要为追求一致性而虚报。\n\n"
+        "**【强制约束2：20年信心指数含义】**\n"
+        "信心指数 = 你对该公司20年后护城河仍然稳固的主观确信度（0=不确信，100=极度确信）。\n"
+        "它与分配比例是两个独立维度：\n"
+        "  · 分配比例由Python基于ROE/FCF/利润率等6项财务指标量化计算，反映当前财务相对优势。\n"
+        "  · 信心指数是你对护城河深度与商业模式可持续性的定性判断，可独立于比例高低。\n"
+        "例如：META信心85、谷歌信心95，两者都是高确信，但谷歌的FCF和ROE双项第一，\n"
+        "导致量化分配比例差距较大——这是正常且合理的，请如实填写，不要为追求一致性而虚报。\n\n"
 
-            + (
-                "【季报补充数据（仅供第2节持仓逻辑参考，不影响报告结构和数字）】\n"
-                f"{rag_inject_annual_report}\n"
-                "【季报补充数据结束，请勿续写以上内容，立即按下方格式输出完整报告】\n\n"
-                if rag_inject_annual_report else ""
-            )
+        + (
+            "【季报补充数据（仅供第2节持仓逻辑参考，不影响报告结构和数字）】\n"
+            f"{rag_inject_annual_report}\n"
+            "【季报补充数据结束，请勿续写以上内容，立即按下方格式输出完整报告】\n\n"
+            if rag_inject_annual_report else ""
+        )
 
-            + "**报告格式（必须完整输出）**\n"
+        + "**报告格式（必须完整输出）**\n"
 
-            "### 1. 💰 最终资金分配方案\n"
-            "以下表格比例和金额已由系统精确计算，**禁止修改任何数字**，"
-            "只需在每行填入投资逻辑标签（5字以内）和信心指数：\n"
-            + alloc_skeleton + "\n"
+        "### 1. 💰 最终资金分配方案\n"
+        "以下表格比例和金额已由系统精确计算，**禁止修改任何数字**，"
+        "只需在每行填入投资逻辑标签（5字以内）和信心指数：\n"
+        + alloc_skeleton + "\n"
 
-            "\n### 2. 深度持仓逻辑\n"
-            "请严格按以下三节结构输出，每节标题固定，禁止更改：\n\n"
-            "#### Meta（META）\n"
-            "持仓理由：请从以下四个维度展开，每个维度1-2句，合计不少于5句：\n"
-            "  · 盈利质量：结合ROE排名与Operating Margin护城河说明其定价权来源；\n"
-            "  · 护城河机制：解释广告平台网络效应如何形成不可复制的数据飞轮；\n"
-            "  · 成长驱动：结合季报数据或新闻，说明AI/可穿戴/Reality Labs的增量空间；\n"
-            "  · 20年持有逻辑：阐述为何即使短期估值偏高，长期复利仍有充分保障。\n"
-            "最大毁灭性风险：用2-3句描述：①风险具体场景；②为何足以彻底摧毁持仓逻辑；③当前是否有早期预警信号。\n\n"
-            "#### 亚马逊（AMZN）\n"
-            "持仓理由：请从以下四个维度展开，每个维度1-2句，合计不少于5句：\n"
-            "  · 盈利质量：结合ROE与Operating Margin，分析AWS利润率对整体盈利的支撑；\n"
-            "  · 护城河机制：说明AWS云业务转换成本与物流网络双重壁垒如何相互强化；\n"
-            "  · 成长驱动：结合季报数据或新闻，说明AWS、广告、Prime会员的协同增长空间；\n"
-            "  · 20年持有逻辑：说明亚马逊从零售到基础设施的战略演化为何具备持久竞争力。\n"
-            "最大毁灭性风险：用2-3句描述：①风险具体场景；②为何足以彻底摧毁持仓逻辑；③当前是否有早期预警信号。\n\n"
-            "#### 谷歌（GOOG）\n"
-            "持仓理由：请从以下四个维度展开，每个维度1-2句，合计不少于5句：\n"
-            "  · 盈利质量：结合ROE第一与FCF第一，分析谷歌的现金生成能力与资本效率；\n"
-            "  · 护城河机制：解释搜索引擎数据规模效应与AI（Gemini/TPU）双护城河的协同逻辑；\n"
-            "  · 成长驱动：结合季报数据或新闻，说明Google Cloud与AI基础设施的中长期增量；\n"
-            "  · 20年持有逻辑：阐述为何谷歌的数据壁垒与AI先发优势使其长期优势最为稳固。\n"
-            "最大毁灭性风险：用2-3句描述：①风险具体场景；②为何足以彻底摧毁持仓逻辑；③当前是否有早期预警信号。\n\n"
+        "\n### 2. 深度持仓逻辑\n"
+        "请严格按以下三节结构输出，每节标题固定，禁止更改：\n\n"
+        "#### Meta（META）\n"
+        "持仓理由：请从以下四个维度展开，每个维度1-2句，合计不少于5句：\n"
+        "  · 盈利质量：结合ROE排名与Operating Margin护城河说明其定价权来源；\n"
+        "  · 护城河机制：解释广告平台网络效应如何形成不可复制的数据飞轮；\n"
+        "  · 成长驱动：结合季报数据或新闻，说明AI/可穿戴/Reality Labs的增量空间；\n"
+        "  · 20年持有逻辑：阐述为何即使短期估值偏高，长期复利仍有充分保障。\n"
+        "最大毁灭性风险：用2-3句描述：①风险具体场景；②为何足以彻底摧毁持仓逻辑；③当前是否有早期预警信号。\n\n"
+        "#### 亚马逊（AMZN）\n"
+        "持仓理由：请从以下四个维度展开，每个维度1-2句，合计不少于5句：\n"
+        "  · 盈利质量：结合ROE与Operating Margin，分析AWS利润率对整体盈利的支撑；\n"
+        "  · 护城河机制：说明AWS云业务转换成本与物流网络双重壁垒如何相互强化；\n"
+        "  · 成长驱动：结合季报数据或新闻，说明AWS、广告、Prime会员的协同增长空间；\n"
+        "  · 20年持有逻辑：说明亚马逊从零售到基础设施的战略演化为何具备持久竞争力。\n"
+        "最大毁灭性风险：用2-3句描述：①风险具体场景；②为何足以彻底摧毁持仓逻辑；③当前是否有早期预警信号。\n\n"
+        "#### 谷歌（GOOG）\n"
+        "持仓理由：请从以下四个维度展开，每个维度1-2句，合计不少于5句：\n"
+        "  · 盈利质量：结合ROE第一与FCF第一，分析谷歌的现金生成能力与资本效率；\n"
+        "  · 护城河机制：解释搜索引擎数据规模效应与AI（Gemini/TPU）双护城河的协同逻辑；\n"
+        "  · 成长驱动：结合季报数据或新闻，说明Google Cloud与AI基础设施的中长期增量；\n"
+        "  · 20年持有逻辑：阐述为何谷歌的数据壁垒与AI先发优势使其长期优势最为稳固。\n"
+        "最大毁灭性风险：用2-3句描述：①风险具体场景；②为何足以彻底摧毁持仓逻辑；③当前是否有早期预警信号。\n\n"
 
-            "### 3. 关键财务指标对比\n"
-            "**以下表格已由系统精确生成，请原样输出，一个字符都不要修改：**\n"
-            + metrics_table_md + "\n\n"
+        "### 3. 关键财务指标对比\n"
+        "**以下表格已由系统精确生成，请原样输出，一个字符都不要修改：**\n"
+        + metrics_table_md + "\n\n"
 
-            "\n### 4. 首席投资官总结\n"
-            "请写3-4段，每段不少于3句，具体要求：\n"
-            "  · 第1段【组合策略】：说明为何以GOOG为核心重仓、META为第二仓位、AMZN为压舱石；核心逻辑是长期复利能力而非短期估值；结合FCF与ROE双维度数据支撑判断。\n"
-            "  · 第2段【芒格哲学引用】：若任务开头附有投资哲学参考摘要，引用其中至少一条具体观点并注明来源页码；若无摘要，则运用你所熟知的芒格/格雷厄姆经典原则（护城河/能力圈/安全边际），说明该原则如何直接指导本组合构建逻辑。\n"
-            "  · 第3段【风险对冲观】：说明三家公司的主要风险（监管/AI竞争/宏观）在组合层面如何相互分散，以及何种宏观情景会使整个组合同时承压。\n"
-            "  · 第4段【20年信心声明】：以首席投资官口吻，用肯定语气陈述20年后这三家公司护城河仍然稳固的核心理由，并说明在什么条件下会考虑增持或减持。\n"
-        ),
-        expected_output="按报告格式完整输出四节内容：第2节每家公司持仓理由不少于5句分四维度；第4节首席投资官总结写3-4段，含芒格哲学引用（有知识库则注明页码，无则引用经典原则）。数字禁止修改，公司名称使用规定格式。",
-        agent=chief_strategist,
-        context=[task_analysis, task_news],
+        "\n### 4. 首席投资官总结\n"
+        "请写3-4段，每段不少于3句，具体要求：\n"
+        "  · 第1段【组合策略】：说明为何以GOOG为核心重仓、META为第二仓位、AMZN为压舱石；"
+        "核心逻辑是长期复利能力而非短期估值；结合FCF与ROE双维度数据支撑判断。\n"
+        "  · 第2段【芒格哲学引用】：若任务开头附有投资哲学参考摘要，引用其中至少一条具体观点并注明来源页码；"
+        "若无摘要，则运用你所熟知的芒格/格雷厄姆经典原则（护城河/能力圈/安全边际），"
+        "说明该原则如何直接指导本组合构建逻辑。\n"
+        "  · 第3段【风险对冲观】：说明三家公司的主要风险（监管/AI竞争/宏观）在组合层面如何相互分散，"
+        "以及何种宏观情景会使整个组合同时承压。\n"
+        "  · 第4段【20年信心声明】：以首席投资官口吻，用肯定语气陈述20年后这三家公司护城河仍然稳固的核心理由，"
+        "并说明在什么条件下会考虑增持或减持。\n"
+    )
+    _task_report_expected = (
+        "按报告格式完整输出四节内容：第2节每家公司持仓理由不少于5句分四维度；"
+        "第4节首席投资官总结写3-4段，含芒格哲学引用（有知识库则注明页码，无则引用经典原则）。"
+        "数字禁止修改，公司名称使用规定格式。"
     )
 
-    crew = Crew(
-        agents=[data_analyst, news_researcher, chief_strategist],
-        tasks=[task_analysis, task_news, task_report],
-        process=Process.sequential,
-        verbose=True,
-        memory=False,
-        # llm= 和 manager_llm= 均不在 Crew 级别设置。
-        # Agent 级别已通过 llm="groq/..." 字符串直接绑定 LiteLLM Groq 路由，
-        # Crew 级别重复设置反而触发额外路由检查。
-    )
+    # ══════════════════════════════════════════════════════════════════════
+    # 【核心修复】两阶段执行：彻底解决 Groq 免费层 12K TPM/min 限制
+    # ══════════════════════════════════════════════════════════════════════
+    # 根本原因：
+    #   3 个 Agent 在不足 1 分钟内连续运行，合计消耗 ~21K tokens/min，
+    #   远超 Groq 免费层 12K/min 上限。
+    #
+    # 旧方案（app.py 之前版本）的致命缺陷：
+    #   触发限速后"整队重启"——Agent1+2 在新窗口重跑，再次消耗 ~9K tokens，
+    #   Agent3 依然在同窗口内超限，陷入死循环，根本无法成功。
+    #
+    # 新方案（两阶段 + 阶段间等待）：
+    #   第1阶段：数据分析师 + 情报研究员（~5K tokens/min，安全）
+    #   阶段间：强制等待 75 秒，确保 Groq 1 分钟滑动窗口彻底清零
+    #   第2阶段：首席投资官（~4.5K tokens，有充足余量）
+    #
+    # 额外优化：Phase 1 输出以截断文本注入 task_report，
+    #   不走 CrewAI context= 机制（该机制会把完整 task 输出 ~4K tokens 拼入 prompt）。
+    # ══════════════════════════════════════════════════════════════════════
+
+    import time as _time
 
     # ── 重定向 stdout / stderr / logging ──────────────────────────────────
     _stream = StreamToStreamlit(thinking_placeholder)
@@ -1495,8 +1522,117 @@ def run_crewai_analysis(stock_data_str: str, thinking_placeholder, df=None):
     if _root_logger.level == logging.NOTSET or _root_logger.level > logging.INFO:
         _root_logger.setLevel(logging.INFO)
 
+    def _is_rate_limit_err(exc: Exception) -> bool:
+        s = str(exc).upper()
+        return any(k in s for k in (
+            "RATE_LIMIT", "RATELIMIT", "RATE LIMIT",
+            "429", "TPM", "RPM",
+            "TOKENS PER MINUTE", "REQUESTS PER MINUTE",
+            "TOKEN_LIMIT_EXCEEDED", "RATE_LIMIT_EXCEEDED",
+        ))
+
+    _PHASE_MAX_RETRIES = 2
+    _PHASE_WAIT_BASE   = 65   # seconds — 超过 Groq 1 分钟滑动窗口
+
+    result = None
     try:
-        result = crew.kickoff()
+        # ─────────────────────────────────────────────────────────────────
+        # 第1阶段：数据分析师 + 情报研究员（合计约 4–5K tokens/min）
+        # ─────────────────────────────────────────────────────────────────
+        crew_phase1 = Crew(
+            agents=[data_analyst, news_researcher],
+            tasks=[task_analysis, task_news],
+            process=Process.sequential,
+            verbose=True,
+            memory=False,
+        )
+        _stream.write("\n🔬 [第 1/2 阶段] 定量分析师 + 情报研究员正在运行……\n")
+
+        for _attempt in range(_PHASE_MAX_RETRIES):
+            try:
+                _result_p1 = crew_phase1.kickoff()
+                break
+            except Exception as _e1:
+                if _is_rate_limit_err(_e1) and _attempt < _PHASE_MAX_RETRIES - 1:
+                    _wait = _PHASE_WAIT_BASE * (_attempt + 1)
+                    _stream.write(
+                        f"\n⚠️ [第1阶段] Groq TPM 限速，等待 {_wait}s 后重试……\n"
+                    )
+                    _time.sleep(_wait)
+                else:
+                    raise
+
+        # ── 提取 Phase 1 输出（截断后注入 task_report，不走 context 机制）──────
+        _analysis_out = ""
+        _news_out     = ""
+        try:
+            if hasattr(task_analysis, "output") and task_analysis.output:
+                _analysis_out = (getattr(task_analysis.output, "raw", "") or "")[:500]
+        except Exception:
+            pass
+        try:
+            if hasattr(task_news, "output") and task_news.output:
+                _news_out = (getattr(task_news.output, "raw", "") or "")[:500]
+        except Exception:
+            pass
+
+        # ── 阶段间等待：确保 Groq 1 分钟滑动窗口彻底清零 ─────────────────────
+        _inter_wait = 75
+        _stream.write(
+            f"\n⏳ [阶段间等待] 第1阶段完成，等待 {_inter_wait} 秒让 Groq TPM 窗口清零……\n"
+        )
+        _time.sleep(_inter_wait)
+
+        # ─────────────────────────────────────────────────────────────────
+        # 第2阶段：首席投资官（独立窗口，约 4.5K tokens，有充足余量）
+        # ─────────────────────────────────────────────────────────────────
+        # 将 Phase 1 摘要作为纯文本前缀注入，而非 CrewAI context 机制。
+        # CrewAI context 会把 task1/task2 完整输出（各约 2K tokens）拼入 prompt，
+        # 手动截断到 500 字可节省 ~3K tokens。
+        _phase1_inject = ""
+        if _analysis_out:
+            _phase1_inject += (
+                "【前序：定量分析师结论摘要（系统生成，限 500 字）】\n"
+                + _analysis_out
+                + "\n\n"
+            )
+        if _news_out:
+            _phase1_inject += (
+                "【前序：市场情报专家结论摘要（系统生成，限 500 字）】\n"
+                + _news_out
+                + "\n\n"
+            )
+
+        task_report_final = Task(
+            description=(_phase1_inject + _task_report_desc),
+            expected_output=_task_report_expected,
+            agent=chief_strategist,
+            # context= 不传：避免 CrewAI 将完整 task 输出拼入 prompt 导致 token 膨胀
+        )
+
+        crew_phase2 = Crew(
+            agents=[chief_strategist],
+            tasks=[task_report_final],
+            process=Process.sequential,
+            verbose=True,
+            memory=False,
+        )
+        _stream.write("\n💼 [第 2/2 阶段] 首席投资官正在制定投资方案……\n")
+
+        for _attempt in range(_PHASE_MAX_RETRIES):
+            try:
+                result = crew_phase2.kickoff()
+                break
+            except Exception as _e2:
+                if _is_rate_limit_err(_e2) and _attempt < _PHASE_MAX_RETRIES - 1:
+                    _wait = _PHASE_WAIT_BASE * (_attempt + 1)
+                    _stream.write(
+                        f"\n⚠️ [第2阶段] Groq TPM 限速，等待 {_wait}s 后重试……\n"
+                    )
+                    _time.sleep(_wait)
+                else:
+                    raise
+
     finally:
         sys.stdout = _old_stdout
         sys.stderr = _old_stderr
