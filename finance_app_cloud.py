@@ -33,7 +33,7 @@ import os
 os.environ["OTEL_SDK_DISABLED"] = "true"
 os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
 # =============================================================================
-# 【LLM 兼容层 v8 — ChatOpenAI + Groq 兼容接口（镜像本地版成功方案）】
+# 【LLM 兼容层 v9b — ChatOpenAI + crewai 版本锁定（根治 pydantic 和 LiteLLM 双重问题）】
 #
 # 完整错误历史：
 #   v1-v3: dummy OPENAI_API_KEY → LiteLLM 拿假 key 真发 OpenAI 请求 → 401
@@ -41,15 +41,15 @@ os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
 #   v5:    CrewAI LLM("groq/...") → LiteLLM Groq provider 缺失 → Fallback not available
 #   v6:    ChatGroq + pop(OPENAI_API_KEY) → LiteLLM import 存在性检查 → OPENAI_API_KEY is required
 #   v7:    CrewLLM("openai/...") → 仍走 LiteLLM 路由 → Fallback not available
+#   v8:    ChatOpenAI(base_url=Groq) → 稳定运行
+#   v9:    crewai.LLM("groq/...") → 适配 crewai 0.63+ pydantic 验证，但 Streamlit Cloud
+#          上的旧版 LiteLLM 仍报 "Fallback to LiteLLM is not available"
 #
-# v8 根本解（镜像本地 finance_app_local.py 成功运行的方案）：
-#   本地版用法：OPENAI_API_KEY="ollama" + OPENAI_API_BASE=Ollama + ChatOpenAI(base_url=Ollama)
-#   云端版用法：OPENAI_API_KEY=Groq key（占位，runtime 替换）+
-#              OPENAI_API_BASE=Groq url + ChatOpenAI(base_url=Groq)
-#
-#   核心原理：ChatOpenAI 是纯 LangChain 对象，CrewAI 直接调用其 .invoke()，
-#   完全不经过 LiteLLM 路由层。OPENAI_API_KEY 有值只是为了通过 LiteLLM import
-#   阶段的存在性检查；OPENAI_API_BASE 确保即使内部组件用 env var 发请求也打到 Groq。
+# v9b 根治方案：
+#   crewai 的破坏性变更（拒绝 ChatOpenAI）发生在 0.63.0。
+#   requirements.txt 锁定 crewai<0.63.0，强制 Streamlit Cloud 安装接受 ChatOpenAI 的版本。
+#   代码恢复 v8 的 ChatOpenAI 方案：绕过 LiteLLM 路由，彻底消除 v5/v7/v9 的 LiteLLM 问题。
+#   后续如需升级 crewai，需重新评估 LLM 兼容方案再放开版本约束。
 # =============================================================================
 # 【模块级占位】LiteLLM import 阶段会检查 OPENAI_API_KEY 是否存在（不检查有效性）。
 # 若不存在则抛 "OPENAI_API_KEY is required"，连运行都到不了。
@@ -73,7 +73,7 @@ import yfinance as yf
 import altair as alt
 
 from crewai import Agent, Task, Crew, Process
-from langchain_openai import ChatOpenAI  # 镜像本地版做法：ChatOpenAI 是纯 LangChain 对象，CrewAI 直接调用，完全不经过 LiteLLM 路由
+from langchain_openai import ChatOpenAI  # v9b: crewai<0.63.0 接受 LangChain ChatOpenAI，绕过 LiteLLM 路由
 from crewai.tools import BaseTool
 from langchain_community.tools import DuckDuckGoSearchRun
 from pydantic import BaseModel, Field
@@ -119,11 +119,11 @@ _PLANNED_SEARCHES: list = [
 # =============================================================================
 
 def _get_secret(key: str) -> str:
-    """安全读取 st.secrets，缺失时返回空字符串而不是抛异常。"""
+    """先读 st.secrets（Streamlit Cloud），再读环境变量（HuggingFace），缺失时返回空字符串。"""
     try:
         return st.secrets[key]
     except Exception:
-        return ""
+        return os.environ.get(key, "")
 
 GROQ_API_KEY    = _get_secret("GROQ_API_KEY")
 GEMINI_API_KEY  = _get_secret("GEMINI_API_KEY")
@@ -138,35 +138,26 @@ _FMP_READY    = bool(FMP_API_KEY)
 
 
 # =============================================================================
-# 【云端 LLM 配置】ChatOpenAI + Groq 兼容接口（镜像本地版方案）
+# 【云端 LLM 配置】ChatOpenAI + Groq 兼容接口（v9b，锁定 crewai<0.63.0）
 # =============================================================================
 # 架构变化说明：
 # - 原来：logic_llm = deepseek-r1:7b（Ollama）/ tool_llm = llama3.2（Ollama）
 # - 现在：所有 Agent 统一使用 llama-3.3-70b-versatile（Groq API）
 #   理由：70B 模型指令遵循能力远优于本地 3B/7B，无需分开用两个模型
-#   超时时间从 300s 缩短到 90s：Groq 推理速度极快，通常 5-15 秒完成
 
 def _make_groq_llm():
     """
-    【v8 最终方案】ChatOpenAI 指向 Groq 兼容接口。
+    【v9b】ChatOpenAI 指向 Groq 兼容接口，配合 requirements.txt 锁定 crewai<0.63.0。
 
-    镜像本地版（finance_app_local.py）的成功模式：
-      本地：ChatOpenAI(base_url="http://127.0.0.1:11434/v1", api_key="ollama")
-      云端：ChatOpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_KEY)
-
-    为什么 ChatOpenAI 而非其他方案？
-    - ChatOpenAI 是纯 LangChain 对象，CrewAI 直接调用其 .invoke()
-    - 完全不经过 LiteLLM 路由层，与 LiteLLM 是否有 Groq provider 完全无关
-    - 本地版已验证此方案稳定运行，云端仅需换 base_url 和 api_key
+    crewai<0.63.0 的 Agent.llm 接受任意 LangChain LLM 对象，直接调用 .invoke()，
+    完全不经过 LiteLLM 路由，从根本上消除 v5/v7/v9 的 "Fallback not available" 问题。
+    OPENAI_API_BASE 重定向确保任何内部组件走 env var 发请求也只打到 Groq，不会误用 OpenAI。
     """
     if not GROQ_API_KEY:
         return None
-    # 将真实 Groq key 写入环境变量：
-    # ① 替换模块级占位符，确保 LiteLLM 存在性检查通过
-    # ② 重定向 OPENAI_API_BASE，任何内部组件走 env var 发请求也只会打到 Groq
     os.environ["OPENAI_API_KEY"]  = GROQ_API_KEY
     os.environ["OPENAI_API_BASE"] = "https://api.groq.com/openai/v1"
-    os.environ["OPENAI_BASE_URL"] = "https://api.groq.com/openai/v1"  # openai SDK >= 1.x 读此变量
+    os.environ["OPENAI_BASE_URL"] = "https://api.groq.com/openai/v1"
     os.environ["GROQ_API_KEY"]    = GROQ_API_KEY
     return ChatOpenAI(
         model="llama-3.3-70b-versatile",
