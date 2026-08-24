@@ -3,7 +3,7 @@ name: Repo Keepalive
 on:
   schedule:
     # 每隔2个月的1号 UTC 9:00 自动提交一次，防止仓库因60天无活动被禁用
-    - cron: '0 9 1 */2 *'
+    - cron: '0 9 1 * *'
   workflow_dispatch:  # 保留手动触发，方便立即测试
 
 jobs:
